@@ -1,0 +1,31 @@
+{
+  "name": "unicornbow",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Plague of Light: Rainbow Swarm — 13kB reverse tower defense",
+  "scripts": {
+    "dev": "node tools/dev.mjs",
+    "build": "node tools/build.mjs",
+    "build:squeeze": "node tools/build.mjs --squeeze",
+    "squeeze": "node tools/build.mjs --squeeze",
+    "squeeze:fast": "node tools/build.mjs --squeeze --reuse-params",
+    "squeeze:props": "node tools/build.mjs --squeeze --mangle-all-props",
+    "size": "node tools/size.mjs",
+    "check": "node tools/build.mjs --squeeze --strict",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@gfx/zopfli": "^1.0.15",
+    "esbuild": "^0.28.2",
+    "fflate": "^0.8.3",
+    "html-minifier-terser": "^7.2.0",
+    "roadroller": "^2.1.0",
+    "terser": "^5.50.0"
+  }
+}

@@ -1,0 +1,117 @@
+# GAME DESIGN DOCUMENT (GDD)
+
+# 1. Game Overview
+
+## 1.1 Project Title
+**Gore & Glitter: Prism Survival**
+
+## 1.2 Target Platform
+Web Browser (Desktop & Mobile, hyper-optimized for performance).
+
+## 1.3 Genre
+Reverse Bullet Hell / Arena Survival / Swarm Shooter (Vampire Survivors style).
+
+## 1.4 Hard Constraints
+The entire game, compressed into a single `.zip` file, must not exceed 13 kilobytes. This constraint dictates every design and technical decision.
+
+## 1.5 Concept Summary
+You are an unhinged, neon-eyed unicorn—the only source of light—trapped in a silent, monochromatic "Grim Realm." You don't flee from the encroaching shadowy horrors; you pulverize them with refracting orbital rainbow death-lasers and explosive pastel shrapnel. As you collect their remains, you buy procedural upgrades, escalating the chaos into a blinding, ecstatic light show.
+
+## 1.6 Core Gameplay Loop
+1.  **SURVIVE (Dodge):** Player controls movement in a flat, 2D vector arena. Amorphous shadowy enemies approach from all sides in escalating swarms.
+2.  **COMBAT (Auto-Fire):** The Unicorn's horn automatically fires the primary weapon (Refracting Prism Beam) toward the nearest enemy.
+3.  **COLLECT (Glitter Dust):** Defeated enemies leave "Glitter Dust" particles. The player must run over them to collect.
+4.  **UPGRADE:** Collecting enough Glitter Dust triggers a level-up, allowing the player to select from three randomized procedural upgrades (e.g., increased splits, defensive auras, explosive shrapnel).
+5.  **SCALE:** Difficulty is programmatically increased (more enemies, faster spawns, higher HP) over time.
+
+## 1.7 Art style
+The game is completely rendered procedural using a cel-shaded, stylized and hand-drawn art style with ultra-hd vfx and animations like for walk/run cycles.
+All animations need to be hyper realistic, use web references to get them right, check carefully with chrome mcp to detect inconsistencies.
+---
+
+## 2. Mechanics: The Unicorn
+
+The simulation revolves around the Unicorn as the singular entity of light in the realm.
+
+## 2.1 Player Character (The Neon Prism)
+The Unicorn is rendered purely via vector math and Canvas effects.
+
+### A. Core Properties
+*   **Visual Representation:** A procedural vector shape.
+    *   *Body:* A dark polygon (`#080808`).
+    *   *Mane/Tail:* Rendered as intense, overlapping neon lines (Magenta, Cyan) with global `ctx.shadowBlur` enabled.
+    *   *Eyes/Horn:* Neon Pink (`#FF1493`), pulsing.
+*   **Movement:** Fluid 8-way directional movement (WASD/Arrows or Mobile virtual joystick). Slow deceleration to simulate a 'skating' feel.
+
+### B. Progression (Leveling)
+The "Level-Up" mechanic is critical for the reverse bullet hell formula.
+
+*   **Glitter Level (Experience Bar):** Visualized as a filling neon pink bar at the top of the screen.
+*   **Experience Points (XP):** Glitter Dust particles have an attraction radius (`1.5x` player size) and a pull force toward the player.
+*   **Procedural Choice:** Upon level-up, the game pauses, and a minimal UI overlays, offering three randomized, *non-indexed* upgrades (see Section 3).
+
+## 2.2 Core Combat System (The Refracting Prism)
+Combat is fully automatic; the player *is* the weapon.
+
+*   **Primary Weapon:** The Refracting Beam.
+*   **Targeting Logic:** The game selects the **Nearest Enemy** within a $180^\circ$ forward arc.
+*   **The Refraction Mechanic (Primary Fun Factor):**
+    1.  The horn fires a single, thick, multi-color laser (using linear gradients).
+    2.  On contact with an enemy, the primary beam is consumed.
+    3.  Instantly, $N$ **Split Beams** are spawned at the collision point ($N$ starts at 1, increased by upgrades).
+    4.  These Split Beams are thinner vector lines, randomized within a $60^\circ$ cone from the point of impact, potentially chain-reacting.
+
+---
+
+## 3. Upgrades and Progression
+
+Within 13kB, upgrades cannot rely on stored data tables; they must be procedural functions.
+
+## 3.1 Upgrade Types (Math-Based)
+The upgrade list must be kept lean but impactful.
+
+*   **Split (Multiplier):** (Function: `splits++`) Increases $N$, the number of smaller beams spawned on refraction impact.
+*   **Reflexive Aura (Area of Effect):** (Function: `drawCircleAura()`) Generates a constant, rotating vector circle of light around the player. Deals light contact damage to enemies that touch it. Visually: A faint, spinning magenta outline.
+*   **Confetti Grenades (On-Death Effect):** (Function: `triggerExplosionOnKill()`) Enemies killed have a $10\%$ probability (upgradable) of triggering a radial burst of particle 'shrapnel.'
+*   **Prism Focus (Piercing):** (Function: `pierceCount++`) Primary beam can pass through one additional enemy before refracting.
+
+---
+
+## 4. Systems: The Grim Realm (Enemies and World)
+
+## 4.1 Arena (The Void)
+*   **Visuals:** A monochromatic `fillRect()` background (dark charcoal `#111111`). Ground texture is generated by sparse, irregular, dark grey vector lines simulating cracked earth.
+*   **Boundary:** A recursive vector wall (simple `#333333` line rectangle) that wraps player/enemies (pac-man style) or blocks movement, depending on memory budget.
+
+## 4.2 Shadows (The Horde)
+Enemies are optimized for rendering in massive numbers (5,000+ units).
+
+*   **Visual Representation:** Simple, dark, undulating vector blobs or irregular polygons. No features.
+*   **Movement:** Simple Seek behavior (`EnemyX -> PlayerX`) with randomized speed offset to create variation in the swarm.
+*   **Collision:** Standard AABB collision for performance.
+
+## 4.3 Progression & Scaling (Infinite Difficulty)
+Scaling must be procedural and memoryless.
+
+*   **Game State:** The only stored progression variable is `timeAlive`.
+*   **Scaling Function:** Enemy HP, Enemy Count (Swarm Size), and Enemy Speed are all calculated based on a fixed ratio relative to `timeAlive`:
+    *   *Count* = `baseCount` + `floor(timeAlive / 10sec) * countMultiplier`
+    *   *Speed* = `baseSpeed` + `sin(timeAlive) * speedVariation` (creating 'waves' of intensity).
+
+---
+
+## 5. Technical: 13kB Strategy (Juice via Math)
+
+Feedback is paramount. In 13kB, feedback (Juice) is simulated with intense particle bursts and procedural screen manipulation.
+
+## 5.1 Juice Systems
+*   **Confetti Gore (Particle Explosion):** Enemies are not deleted; they explode. A single `Explosion` function spawns 20-50 particle vectors (`fillStyle = rainbowHSL`), applying intense radial velocity and decay (`opacity -> 0`) over 20 frames. This must be cheap to run multiple times per second.
+*   **Dynamic Lighting:** The entire scene brightness is modulated. When the horn fires or a large explosion occurs, the global ambient light `canvas.globalCompositeOperation = 'lighter'` is temporarily increased, blinding the player.
+*   **Shadow Blur (The Neon Glow):** The game’s aesthetic relies entirely on `ctx.shadowBlur`. While high performance-cost, it is invaluable for byte-economy, creating an intense, expensive look from single lines.
+
+## 5.2 Audio Synthesis (Web Audio API)
+No audio files are used. Sounds are procedurally synthesized using `OscillatorNode`.
+
+*   **Horn Laser:** A fast frequency sweep (Chirp) from low to high using a sawtooth wave.
+*   **Explosion:** White noise generator with an exponential volume decay filter.
+*   **Glitter Collect:** High-pitch, short square wave blip.
