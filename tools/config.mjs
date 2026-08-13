@@ -30,7 +30,9 @@ export const esbuildOptions = (mode /* 'release' | 'dev' */) => ({
   bundle: true,
   format: 'iife',
   // Modern-only target: no transpiled helpers, no polyfills, shortest output.
-  target: ['es2020', 'chrome80', 'firefox78', 'safari14'],
+  // Safari 15, not 14: esbuild refuses to emit destructuring for Safari 14
+  // (it has a known engine bug) and cannot lower it either.
+  target: ['es2020', 'chrome80', 'firefox78', 'safari15'],
   // Emit real UTF-8 instead of \uXXXX escapes — smaller and roadroller-friendly.
   charset: 'utf8',
   legalComments: 'none',

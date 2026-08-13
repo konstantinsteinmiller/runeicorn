@@ -80,13 +80,13 @@ winner with `<-`.
 
 Measured on this project:
 
-| Payload after terser | plain zip  | roadroller zip | winner     |
-| -------------------- | ---------- | -------------- | ---------- |
-| 1.7 kB (current seed)| **1,228**  | 1,667          | plain      |
-| 124 kB (stress test) | 20,454     | **12,414**     | roadroller |
+| Payload after terser  | plain zip  | roadroller zip | winner     |
+| --------------------- | ---------- | -------------- | ---------- |
+| 1.7 kB (early seed)   | **1,228**  | 1,667          | plain      |
+| 32 kB (shipping game) | 14,725     | **12,287**     | roadroller |
 
-Break-even sits around 2.5–3 kB of minified JS, so roadroller will take over on
-its own once the real game lands. Nothing to switch on.
+Break-even sits around 2.5–3 kB of minified JS. The shipping game is far past
+it, so roadroller wins by ~2.2 kB — which is the entire reason the game fits.
 
 `-O2` searches ~300 parameter sets and is the slow part of a release build. The
 winning parameters are cached in `dist/.roadroller-params.json`;
@@ -111,8 +111,12 @@ A 13kB game that does not boot is worth zero bytes, so the build refuses to
 produce a broken artifact:
 
 - **Decoder round-trip.** The roadroller output is executed in a `vm` sandbox
-  with `eval` stubbed, and the decompressed source is compared byte-for-byte
-  with the input. A packer or escaping regression fails the build.
+  with `eval` stubbed, and the decompressed source is checked against the
+  input. Roadroller re-emits JS from its own tokenizer, so the round trip is
+  semantic rather than byte-exact — token spacing shifts and non-ASCII string
+  literals come back escaped (`—` → `—`). The build therefore asserts the
+  decoded payload still parses and canonicalises both sides through esbuild
+  before comparing. A packer or escaping regression fails the build.
 - **Zip round-trip.** The archive is re-parsed with fflate (a third-party
   reader) and every entry is compared against the original bytes.
 - **Syntax checks** after minification and after `</script` escaping.

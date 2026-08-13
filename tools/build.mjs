@@ -219,28 +219,43 @@ async function pack(js) {
   const inputs = [{ data: js, type: 'js', action: 'eval' }]
   const cachePath = abs(PATHS.paramCache)
 
-  let best = null
-  if (OPT.reuseParams && fs.existsSync(cachePath)) {
+  // Seed from the cached parameters whenever we have them. The optimizer is a
+  // stochastic search: starting cold can land WORSE than a previous run, so we
+  // always start from the best set found so far and let it improve on that.
+  let cached = null
+  if (fs.existsSync(cachePath)) {
     try {
-      best = JSON.parse(fs.readFileSync(cachePath, 'utf8')).best
-      say(c.dim('  · reusing cached roadroller parameters'))
+      cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'))
     } catch {
-      best = null
+      cached = null
     }
   }
 
-  const reused = !!best
+  let best = cached?.best || null
+  const reused = OPT.reuseParams && !!best
   let packer = new Packer(inputs, { ...packerOptions, ...(best || {}) })
-  if (!best) {
+
+  if (!reused) {
+    if (best) say(c.dim('  · improving on cached roadroller parameters'))
     const bar = makeProgress(`  · roadroller -O${level}`)
     const result = await packer.optimize(level, bar.tick)
     bar.done()
-    best = result.best
-    try {
-      fs.writeFileSync(cachePath, JSON.stringify({ best }, null, 2))
-    } catch {
-      /* cache is a nicety */
+    const size = result.bestSize?.[0] ?? Infinity
+    // Keep whichever parameter set actually compresses smaller.
+    if (!cached || size <= (cached.size ?? Infinity)) {
+      best = result.best
+      try {
+        fs.writeFileSync(cachePath, JSON.stringify({ best, size }, null, 2))
+      } catch {
+        /* cache is a nicety */
+      }
+    } else {
+      say(c.dim(`  · keeping cached parameters (${Math.ceil(cached.size)} B beats ${Math.ceil(size)} B)`))
+      best = cached.best
+      packer = new Packer(inputs, { ...packerOptions, ...best })
     }
+  } else {
+    say(c.dim('  · reusing cached roadroller parameters'))
   }
 
   let decoded = packer.makeDecoder()
@@ -303,12 +318,32 @@ function verifyDecoder(packedCode, expected) {
     say(c.yellow('  · could not intercept the decoder — skipping round-trip check'))
     return
   }
-  if (captured !== expected) {
+  // Roadroller re-emits `type: 'js'` input from its own tokenizer, so the
+  // round trip is SEMANTICALLY identical but not byte identical: token spacing
+  // changes, and non-ASCII string literals come back escaped (— -> —).
+  // Verify the property that actually matters — the code still parses and
+  // still means the same thing — by canonicalising both sides through esbuild.
+  assertParses(captured, 'roadroller-decoded payload')
+  const norm = (s) => s.replace(/\s+/g, '')
+  // Normalise whitespace, syntax and string escapes — but do NOT rename
+  // identifiers. esbuild's mangler picks names by frequency and can break a
+  // tie differently for two formattings of the same program, which shows up
+  // as a bogus one-character diff.
+  const canon = (s) =>
+    esbuild.transformSync(s, {
+      minifyWhitespace: true,
+      minifySyntax: true,
+      minifyIdentifiers: false,
+      target: 'es2020',
+      charset: 'ascii',
+    }).code
+  if (norm(captured) !== norm(expected) && canon(captured) !== canon(expected)) {
     throw new Error(
-      `roadroller round-trip mismatch: decoded ${captured.length} bytes, expected ${expected.length}`,
+      `roadroller round-trip mismatch: decoded ${captured.length} B vs input ${expected.length} B — ` +
+        `the difference is not whitespace or string escaping`,
     )
   }
-  say(c.dim('  · decoder round-trip verified'))
+  say(c.dim('  · decoder round-trip verified (semantic equivalence)'))
 }
 
 function assertParses(code, what) {

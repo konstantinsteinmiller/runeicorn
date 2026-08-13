@@ -1,171 +1,223 @@
-/* global DEBUG, c */
 /**
- * Plague of Light: Rainbow Swarm — seed.
+ * Plague of Light: Rainbow Swarm — boot, input, scene flow.
  *
- * This is a deliberately small vertical slice (hive -> drawn trail -> swarm
- * follows -> rainbow trail rendering) that exists so the 13kB pipeline has a
- * realistic payload to measure against. Replace it with the real game; the
- * build does not care what is in here.
- *
- * Size conventions used throughout (see BUILD.md):
- *   - `_`-prefixed properties are mangled away by terser.
- *   - `DEBUG` is a compile-time constant; DEBUG blocks vanish in release.
- *   - `c` is the <canvas id=c> element, reached through the implicit global.
+ * No main menu by design: the world is already alive behind the title card,
+ * and the card dissolves the moment the player draws their first trail.
  */
+import {
+  S,
+  SC_PLAY,
+  SC_CLEAR,
+  SC_DEAD,
+  SC_MAP,
+  project,
+  hint,
+} from './state.js'
+import { min, max, clamp } from './u.js'
+import { buildAtlas } from './sprites.js'
+import { makeRegion, REGIONS } from './world.js'
+import { startTrail, extendTrail, endTrail } from './trail.js'
+import { step, overload } from './sim.js'
+import { updateFx } from './fx.js'
+import { initAudio, tickAudio, toggleMute, music, sfx } from './audio.js'
+import { layoutUI, uiHit, isUI } from './ui.js'
+import { initRender, resizeRender, frame, PROF, Q } from './render.js'
 
-const g = c.getContext('2d')
-
-/** Whole game state. `_`-prefixed keys get renamed to one character. */
-const S = {
-  _units: [],
-  _trail: [], // flat [x, y, x, y, ...] polyline
-  _dust: 0,
-  _hiveX: 0,
-  _hiveY: 0,
-  _spawnAcc: 0,
-}
-
-let drawing = 0
+// Queried, not taken from the `id=c` implicit global: toplevel mangling is
+// free to name one of its own variables `c` and would shadow it.
+const cv = document.querySelector('canvas')
+const g = cv.getContext('2d')
 let last = 0
+let started = 0
 
-const rnd = Math.random
-const TAU = Math.PI * 2
+/* ------------------------------ layout ------------------------------ */
 
 const resize = () => {
-  c.width = innerWidth
-  c.height = innerHeight
-  S._hiveX = c.width / 2
-  S._hiveY = c.height * 0.85
+  // Capped at 1.5, not 2: this is a fill-rate bound game (900 sprites + an
+  // additive bloom composite), and a retina backing store costs ~1.8x the
+  // pixels for a difference the neon glow hides anyway.
+  S.dpr = min(1.5, devicePixelRatio || 1)
+  S.w = innerWidth
+  S.h = innerHeight
+  cv.width = (S.w * S.dpr) | 0
+  cv.height = (S.h * S.dpr) | 0
+  layoutUI()
+  project()
+  resizeRender()
 }
 
-/* ------------------------------- input ------------------------------ */
+/* ------------------------------ scenes ------------------------------ */
 
-const push = (e) => {
-  const t = S._trail
-  const x = e.clientX
-  const y = e.clientY
-  const l = t.length
-  if (l < 2 || Math.hypot(x - t[l - 2], y - t[l - 1]) > 14) t.push(x, y)
+const load = (i) => {
+  makeRegion(i)
+  project()
+  S.scene = SC_PLAY
+  S.over = 0
+  hint('Drag from a glowing hive', 6)
 }
 
-onpointerdown = (e) => {
-  drawing = 1
-  S._trail = []
-  push(e)
+/** Advance past an end-of-scene panel. */
+const advance = () => {
+  if (S.scene === SC_CLEAR) {
+    S.scene = SC_MAP
+    S.over = 0
+    sfx('ui')
+  } else if (S.scene === SC_MAP) {
+    load(S.region + 1)
+  } else if (S.scene === SC_DEAD) {
+    load(S.region)
+  }
 }
-onpointermove = (e) => drawing && push(e)
-onpointerup = onpointercancel = () => (drawing = 0)
+
+/* ------------------------------ input ------------------------------- */
+
+const pos = (e) => {
+  S.px = e.clientX
+  S.py = e.clientY
+}
+
+/** Tutorial is shown once ever, then only on demand. Storage may be blocked. */
+const SEEN = 'pol_seen'
+const seen = (v) => {
+  try {
+    return v === undefined ? localStorage[SEEN] : (localStorage[SEEN] = v)
+  } catch {
+    // Storage blocked (file://, strict privacy modes): fail toward TEACHING.
+    // A new player who never sees the tutorial is a worse outcome than a
+    // returning player dismissing it again.
+    return ''
+  }
+}
+
+const down = (e) => {
+  initAudio()
+  if (!started) {
+    started = 1
+    music(1)
+  }
+  pos(e)
+  const hit = uiHit(S.px, S.py)
+  if (hit === 'closehelp') {
+    S.help = 0
+    seen('1')
+    sfx('ui')
+    return
+  }
+  if (hit === 'help') {
+    S.help = 1
+    sfx('ui')
+    return
+  }
+  if (hit === 'mute') {
+    toggleMute()
+    sfx('ui')
+    return
+  }
+  if (hit === 'overload') {
+    overload()
+    return
+  }
+  if (S.scene !== SC_PLAY) {
+    // Any tap outside the chrome advances the panel.
+    if (S.over > 0.45) advance()
+    return
+  }
+  if (isUI(S.px, S.py)) return
+  S.down = 1
+  if (startTrail(S.px, S.py)) S.intro = 0
+}
+
+const move = (e) => {
+  pos(e)
+  if (S.down && S.scene === SC_PLAY) extendTrail(S.px, S.py)
+}
+
+const up = () => {
+  S.down = 0
+  endTrail()
+}
+
+onpointerdown = down
+onpointermove = move
+onpointerup = up
+onpointercancel = up
 onresize = resize
+oncontextmenu = (e) => e.preventDefault()
 
-/* -------------------------------- sim ------------------------------- */
-
-const spawn = () => {
-  if (S._units.length > 3e3) return
-  S._units.push({
-    x: S._hiveX + rnd() * 20 - 10,
-    y: S._hiveY + rnd() * 20 - 10,
-    vx: 0,
-    vy: 0,
-    i: 0, // index of the trail node this unit is heading for
-  })
-}
-
-const step = (dt) => {
-  S._spawnAcc += dt * 6
-  while (S._spawnAcc > 1) {
-    S._spawnAcc--
-    spawn()
+onkeydown = (e) => {
+  initAudio()
+  if (S.help) {
+    S.help = 0
+    seen('1')
+    return
   }
-
-  const t = S._trail
-  for (const u of S._units) {
-    let ax = 0
-    let ay = 0
-
-    if (t.length > 1) {
-      const i = Math.min(u.i * 2, t.length - 2)
-      const dx = t[i] - u.x
-      const dy = t[i + 1] - u.y
-      const d = Math.hypot(dx, dy) || 1
-      if (d < 22) u.i++
-      ax = (dx / d) * 60
-      ay = (dy / d) * 60
-    } else {
-      // No trail: mill around the hive.
-      ax = (S._hiveX - u.x) * 0.5
-      ay = (S._hiveY - u.y) * 0.5
-    }
-
-    u.vx = (u.vx + ax * dt) * 0.96 + (rnd() - 0.5) * 8
-    u.vy = (u.vy + ay * dt) * 0.96 + (rnd() - 0.5) * 8
-    u.x += u.vx * dt
-    u.y += u.vy * dt
-  }
-
-  // Recycle units that ran off the end of the trail into glitter dust.
-  S._units = S._units.filter((u) => u.i * 2 < t.length + 2)
-  S._dust += dt * S._units.length * 0.01
-}
-
-/* ------------------------------- render ----------------------------- */
-
-const draw = (time) => {
-  const w = c.width
-  const h = c.height
-
-  g.fillStyle = '#07070c'
-  g.fillRect(0, 0, w, h)
-
-  // Rainbow conveyor trail.
-  const t = S._trail
-  if (t.length > 3) {
-    g.lineCap = g.lineJoin = 'round'
-    g.lineWidth = 3 + Math.min(12, S._units.length / 80)
-    for (let i = 2; i < t.length; i += 2) {
-      g.strokeStyle = `hsl(${(i * 6 + time / 8) % 360} 100% 60%)`
-      g.beginPath()
-      g.moveTo(t[i - 2], t[i - 1])
-      g.lineTo(t[i], t[i + 1])
-      g.stroke()
-    }
-  }
-
-  // The swarm.
-  g.globalCompositeOperation = 'lighter'
-  for (const u of S._units) {
-    g.fillStyle = `hsl(${(u.x + u.y + time / 6) % 360} 100% 65%)`
-    g.beginPath()
-    g.arc(u.x, u.y, 1.6, 0, TAU)
-    g.fill()
-  }
-
-  // Hive.
-  g.fillStyle = `hsl(${(time / 5) % 360} 100% 70%)`
-  g.beginPath()
-  g.arc(S._hiveX, S._hiveY, 9 + Math.sin(time / 200) * 2, 0, TAU)
-  g.fill()
-  g.globalCompositeOperation = 'source-over'
-
-  // HUD.
-  g.fillStyle = '#fff'
-  g.font = '14px monospace'
-  g.fillText(`${S._units.length} unicorns   ${S._dust | 0} dust`, 12, 22)
-
-  if (DEBUG) {
-    g.fillStyle = '#0f0'
-    g.fillText(`dev build — trail nodes ${S._trail.length / 2}`, 12, 40)
+  if (e.code === 'Space' || e.key === ' ') {
+    e.preventDefault()
+    if (S.scene === SC_PLAY) overload()
+    else if (S.over > 0.45) advance()
+  } else if (e.key === 'm' || e.key === 'M') {
+    toggleMute()
+  } else if (e.key === 'h' || e.key === 'H' || e.key === '?') {
+    S.help = 1
   }
 }
 
-/* -------------------------------- loop ------------------------------ */
+/* ------------------------------- loop ------------------------------- */
 
-const frame = (time) => {
-  const dt = Math.min(0.05, (time - last) / 1e3) || 0
-  last = time
-  step(dt)
-  draw(time)
-  requestAnimationFrame(frame)
+const loop = (ms) => {
+  requestAnimationFrame(loop)
+  let dt = (ms - last) / 1e3
+  last = ms
+  if (!(dt > 0)) dt = 0
+  dt = min(0.05, dt)
+
+  // Hit-stop: freeze the sim for a few ms on impact, keep drawing.
+  if (S.hitStop > 0) {
+    S.hitStop -= dt
+    dt *= 0.15
+  }
+
+  // Adaptive quality. Hardware varies wildly and a 13kB game cannot ship a
+  // settings menu, so watch the smoothed frame time and drop the expensive
+  // bloom pass when we fall behind. Hysteresis (24ms down, 15ms up) stops it
+  // oscillating frame to frame.
+  S.fdt = S.fdt * 0.94 + dt * 0.06
+  if (S.q) {
+    if (S.fdt > 0.024) S.q = 0
+  } else if (S.fdt < 0.015) S.q = 1
+
+  S.dt = dt
+  S.t += dt
+  S.over += dt
+  if (S.hintT > 0) S.hintT -= dt
+
+  // The tutorial is modal — freeze the world so reopening it mid-region can
+  // never cost the player their hive.
+  if (!S.help) step(dt)
+  updateFx(dt)
+  tickAudio(dt)
+  frame(g)
 }
 
+/* ------------------------------- boot ------------------------------- */
+
+initRender()
 resize()
-requestAnimationFrame(frame)
+buildAtlas()
+
+// Dev-only region jump for QA. DEBUG is a compile-time false in release, so
+// the whole block is dead code the bundler drops.
+if (DEBUG) {
+  window.__load = load
+  window.__S = S
+  window.__PROF = PROF
+  window.__frame = () => frame(g) // render one frame synchronously, for profiling
+  window.__step = (dt) => step(dt) // sim-only, for profiling
+  window.__q = Q // stage on/off switches, for cost attribution
+  window.__fx = (dt) => updateFx(dt)
+}
+
+load(0)
+S.intro = 1
+if (!seen()) S.help = 1 // first ever visit: teach before anything else
+requestAnimationFrame(loop)
