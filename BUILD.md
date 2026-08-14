@@ -181,3 +181,31 @@ Env overrides, useful for experiments and CI:
 | `--strict`           | Exit 1 when over budget.                                       |
 | `--keep-tmp`         | Keep `dist/.tmp/{bundle,terser,payload,packed}.js`.             |
 | `--quiet`            | Print only `<zipBytes> <budget>` (for scripts).                |
+
+## Property mangling is load-bearing (Rune-icorn Duel)
+
+`pnpm release` / `pnpm check` build with `--mangle-all-props`. This is **not
+optional any more** — it is worth ~130 zipped bytes and the entry does not fit
+under 13,312 without it. Two rules follow from that:
+
+1. **Never look up a property with a string built at runtime.** Terser renames
+   `S.guard` but cannot rewrite a `'guard'` sitting in an array, so the lookup
+   silently reads `undefined`. `sim.js` used to decrement its timers through a
+   name table for exactly this reason and had to be written out longhand.
+   Indexing arrays/tables (`RUNES[k]`, `SPELLS[key]`, `S.seen[key]`) is fine —
+   those keys are data, not source-level property names.
+2. **Quote every key that crosses a persistence or API boundary.** Quoted keys
+   are exempt from mangling, so `save()`/`load()` in `state.js` quote all six
+   of theirs. Unquoted, the save format silently changes shape whenever the
+   source is edited, and every player loses their wins, best time and
+   spellbook on update.
+
+`RESERVED_PROPS` in `tools/config.mjs` is the escape hatch for anything else
+that must keep its real name.
+
+### Beware stale `dist/.tmp/`
+
+`dist/.tmp/` holds build intermediates and is **not** cleared between projects.
+Inspecting `dist/.tmp/terser.js` to check what shipped can therefore read a
+file from a completely different game. Verify the real artifact (`dist/index.html`,
+or the running page) instead, or `rm -rf dist/.tmp` first.

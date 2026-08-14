@@ -1,22 +1,26 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
-<title>Plague of Light</title>
+<title>Rune-icorn Duel</title>
 <link rel="icon" href="data:,">
 <style>
-  html, body {
+  /* ONE rule for both elements. Every property here is either required by one
+     of them or inert on the other, which is what lets the two collapse:
+       margin/overflow/background — the letterbox bars are body, canvas is opaque
+       display:block — canvas only (kills the inline baseline gap); body default
+       touch-action  — canvas needs its own opt-out or a touch-drag is stolen by
+                       the browser as a pan/scroll before the stroke ever starts
+     What is NOT here: width/height. resize() writes cv.style.width/height in
+     PIXELS and runs synchronously at boot, before the first paint, so a CSS
+     100% was overwritten every time — and the html,body{height:100%} that
+     existed only to give that percentage something to resolve against went
+     with it. */
+  body, canvas {
     margin: 0;
-    height: 100%;
-    background: #07070c;
     overflow: hidden;
-  }
-  body {
+    background: #07070c;
     touch-action: none;
-  }
-  canvas {
     display: block;
-    width: 100%;
-    height: 100%;
   }
 </style>
 <canvas></canvas>

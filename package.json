@@ -12,8 +12,9 @@
     "squeeze:fast": "node tools/build.mjs --squeeze --reuse-params",
     "squeeze:props": "node tools/build.mjs --squeeze --mangle-all-props",
     "size": "node tools/size.mjs",
-    "check": "node tools/build.mjs --squeeze --strict",
-    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+    "check": "node tools/build.mjs --squeeze --mangle-all-props --strict",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "release": "node tools/build.mjs --squeeze --mangle-all-props --strict"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
