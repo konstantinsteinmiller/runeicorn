@@ -182,7 +182,7 @@ Env overrides, useful for experiments and CI:
 | `--keep-tmp`         | Keep `dist/.tmp/{bundle,terser,payload,packed}.js`.             |
 | `--quiet`            | Print only `<zipBytes> <budget>` (for scripts).                |
 
-## Property mangling is load-bearing (Rune-icorn Duel)
+## Property mangling is load-bearing (Rune-icorn Duels)
 
 `pnpm release` / `pnpm check` build with `--mangle-all-props`. This is **not
 optional any more** — it is worth ~130 zipped bytes and the entry does not fit

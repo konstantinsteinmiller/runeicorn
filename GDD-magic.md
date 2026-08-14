@@ -1,4 +1,4 @@
-# Rune-icorn Duel: Game Design Document
+# Rune-icorn Duels: Game Design Document
 
 **Version:** 1.0
 **Genre:** Arcade Duel, Strategy, Gesture-based Action
@@ -8,7 +8,7 @@
 ## 1. Executive Summary
 
 ### 1.1 High Concept
-Rune-icorn Duel is a fast-paced magical showdown where cute, chibi-style humanoid unicorns clash using a unique gesture-based spellcasting system. Players and a dark-themed NPC must draw primitive runes to prepare powerful combined spells, balanced between offense and defense, with the very atmosphere reflecting the tide of battle.
+Rune-icorn Duels is a fast-paced magical showdown where cute, chibi-style humanoid unicorns clash using a unique gesture-based spellcasting system. Players and a dark-themed NPC must draw primitive runes to prepare powerful combined spells, balanced between offense and defense, with the very atmosphere reflecting the tide of battle.
 
 ### 1.2 Core Gameplay Loop
 1.  **Draw:** The player uses a finger (mobile) or mouse (desktop) to draw primitive rune shapes on the screen.

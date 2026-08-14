@@ -1,9 +1,9 @@
 {
-  "name": "unicornbow",
+  "name": "runeicorn",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Plague of Light: Rainbow Swarm — 13kB reverse tower defense",
+  "description": "Rune-icorn: Duels — 13kB magic casting game",
   "scripts": {
     "dev": "node tools/dev.mjs",
     "build": "node tools/build.mjs",
@@ -14,7 +14,9 @@
     "size": "node tools/size.mjs",
     "check": "node tools/build.mjs --squeeze --mangle-all-props --strict",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-    "release": "node tools/build.mjs --squeeze --mangle-all-props --strict"
+    "release": "node tools/build.mjs --squeeze --mangle-all-props --strict",
+    "build:wavedash": "node tools/build.mjs --squeeze --mangle-all-props --wavedash --out=wavedash-dist --budget=13k",
+    "push:wavedash": "pnpm build:wavedash && wavedash build push"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

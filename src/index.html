@@ -1,8 +1,22 @@
 <!doctype html>
-<meta charset="utf-8">
+<!--
+  Three tags are deliberately ABSENT, worth 62 zipped bytes between them:
+
+    <title>          — the game is played inside a portal iframe, where the
+                       parent page owns the tab name. Only a standalone open
+                       of index.html loses anything.
+    <link rel=icon>  — an empty data: icon existed purely to silence one
+                       favicon 404. The 404 is free; the tag was not.
+    <meta charset>   — SAFE ONLY WHILE THE PAYLOAD IS PURE ASCII, which is a
+                       property of roadroller's output, not a guarantee. ASCII
+                       decodes identically under UTF-8 and the windows-1252
+                       fallback, so no declaration is needed — but one byte
+                       above 127 in the payload would silently mojibake the
+                       whole game. build.mjs ASSERTS this on every build and
+                       fails loudly if it ever stops being true; do not remove
+                       that check while this tag is missing.
+-->
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
-<title>Rune-icorn Duel</title>
-<link rel="icon" href="data:,">
 <style>
   /* ONE rule for both elements. Every property here is either required by one
      of them or inert on the other, which is what lets the two collapse:
