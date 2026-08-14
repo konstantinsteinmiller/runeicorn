@@ -298,16 +298,6 @@ export function drawSky(g, t) {
   }
   RS()
 
-  /* the sun breaking through — the one big soft element in the frame */
-  if (W > 0.04) {
-    AL(W)
-    D.shadowBlur = 150
-    D.shadowColor = '#fe8'
-    BP()
-    D.arc(1040, 120, 44 + sin(t) * 3, 0, TAU)
-    FL('#ffe')
-  }
-
   RS()
 }
 
