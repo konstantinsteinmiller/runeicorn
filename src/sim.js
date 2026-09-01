@@ -1,687 +1,462 @@
 /**
- * The simulation: swarm, enemies, conversion, threat.
+ * sim.js — the duel itself. Owns every rule; draws nothing.
  *
- * Design intent — the player never commands a unit. They shape a FLOW and the
- * flow does the rest. Every system here exists to make that flow legible:
- * growth you can see, losses you can feel, and exactly one counter (the mage)
- * that forces you to redraw.
+ * Flow: pointer stroke -> recognise() -> queue (max 3) -> cast -> a shot ->
+ * resolve against barriers -> HP -> sky -> win/lose. The NPC runs the same
+ * pipeline through `think`, so both duelists obey identical rules.
  */
 import {
   S,
-  ST_GREY,
-  ST_CONV,
-  ST_HIVE,
-  SC_PLAY,
-  SC_CLEAR,
-  SC_DEAD,
-  UNIT_CAP,
-  UNIT_SPD,
-  UNIT_R,
-  SPAWN_MAIN,
-  SPAWN_HIVE,
-  CLONE_RATE,
-  UNIT_DMG,
-  CONV_NEED,
-  CAP_PER_HIVE,
-  OVERLOAD_COST,
-  OVERLOAD_TIME,
-  SOLDIER_HP,
-  SOLDIER_SPD,
-  SOLDIER_DMG,
-  MAGE_CAST,
-  WOUND_R,
-  WOUND_LIFE,
-  nearestTarget,
-  inWound,
-  hint,
+  AX,
+  UX,
+  GY,
+  HDX,
+  HDY,
+  BOX,
+  MAX_RUNES,
+  HP_MAX,
+  FIRE,
+  WIND,
+  ICE,
+  EARTH,
+  PH_DUEL,
+  PH_WIN,
+  PH_LOSE,
+  RUNES,
+  FOES,
+  elemMul,
+  spellFor,
+  save,
 } from './state.js'
-import {
-  hypot,
-  rnd,
-  rand,
-  min,
-  max,
-  clamp,
-  atan2,
-  sin,
-  cos,
-  TAU,
-  segDist,
-} from './u.js'
-import { updateCuts, segLive, pruneTrails, totalLen } from './trail.js'
-import { burst, ring, glitterWave, shakeAdd, flashAdd } from './fx.js'
-import { sfx, setSwarm } from './audio.js'
+import { recognise } from './runes.js'
+import { clamp, damp, rnd, pick, min, max, hypot, abs } from './u.js'
+import { impact, castBurst, fireRain, barrier, rainbowBurst, shakeAdd, flashAdd, trail } from './fx.js'
+import { sfx, setMood } from './audio.js'
 
-/* -------------------- what a rainbow trail is worth ------------------ */
+/* ------------------------------ tuning ------------------------------ */
+/** Projectile speed per spell kind (stage units/sec); fields/heavies wait. */
+const SPD = [980, 0, 0, 0, 1500]
+/** Seconds a delayed spell hangs before it lands. GDD: Fire Rain ~2s. */
+const DELAY = [0, 0.5, 0, 1.7, 0]
+/** Where a duelist's horn is, in stage coords. `e` = is this Umbra. */
+const hornX = (e) => (e ? UX - HDX : AX + HDX)
+const HORN_Y = GY + HDY
 
-/** How far an UNDIRECTED unicorn will stray to hit something. Deliberately
- *  short: without a trail the swarm defends its hive and little else. */
-const LOOSE_RANGE = 130
-/** Speed / damage / conversion multiplier while riding a healthy conveyor. */
-const TRAIL_BONUS = 1.5
-/** Hive output bonus while an unbroken trail leaves it. */
-const LINK_BONUS = 1.3
-
-/** Damage weight of one unicorn — on-trail unicorns hit 50% harder. */
-const wt = (u) => (u.tr ? TRAIL_BONUS : 1)
-
-/* Reused burst option objects. These fire on every unit death and every combat
-   tick; fresh object literals there were the last per-frame allocation source
-   and showed up as GC spikes. fx.burst destructures immediately and never
-   retains them, so mutating a shared object is safe. */
-const SPARK = { hue: 0, spd: 120, life: 0.5, size: 2.6 }
-const DEATH = { hue: 0, spd: 90, life: 0.5, size: 2.4 }
-
-/** Is an intact trail running out of this hive? */
-const linked = (c) => {
-  for (const tr of S.trails) {
-    if (tr.ok && tr.p.length > 3 && hypot(tr.p[0] - c.x, tr.p[1] - c.y) < 90) return 1
-  }
-  return 0
+/* --------------------------- announcements -------------------------- */
+const pop = (s, c, x, y) => {
+  S.pops.push({ s, c: c || '#fff', x: x ?? 640, y: y ?? 300 })
+  if (S.pops.length > 6) S.pops.shift()
 }
 
-/* --------------------------- spatial hash --------------------------- */
+/* ------------------------------ drawing ----------------------------- */
+/** Pointer went down inside the drawing box. */
+export const strokeStart = (x, y) => {
+  S.draw = 1
+  S.pts.length = 0
+  S.pts.push(x, y)
+}
 
-const CELL = 46
-let cells = []
-let cw = 0
-let ch = 0
+/** Pointer moved while drawing. Trails are the only per-move cost. */
+export const strokeMove = (x, y) => {
+  if (!S.draw) return
+  const n = S.pts.length
+  // Keep a fine sample so the ink hugs the real path; 2.5 units is below what
+  // the eye resolves but still throws away jitter while the pointer is still.
+  if (n && hypot(x - S.pts[n - 2], y - S.pts[n - 1]) < 2.5) return
+  // Bound the buffer. The recogniser resamples to 32 points regardless, so a
+  // very long scribble gains nothing by growing without limit.
+  if (n < 1024) S.pts.push(x, y)
+  trail(x, y, (S.pts.length * 0.013) % 1)
+  sfx('draw', clamp((y - BOX.y) / BOX.h, 0, 1))
+}
 
-const rebuildGrid = () => {
-  cw = ((S.w / CELL) | 0) + 2
-  ch = ((S.h / CELL) | 0) + 2
-  const n = cw * ch
-  if (cells.length !== n) {
-    cells = []
-    for (let i = 0; i < n; i++) cells.push([])
+/** Pointer released: classify, then store or nudge. */
+export const strokeEnd = () => {
+  if (!S.draw) return
+  S.draw = 0
+  // A tap or a twitch is not a FAILED rune, it is not an attempt at all. Now
+  // that the whole screen is drawable, without this every stray click would
+  // buzz and shake at the player.
+  const p = S.pts
+  let x0 = 1e9
+  let y0 = 1e9
+  let x1 = -1e9
+  let y1 = -1e9
+  for (let i = 0; i < p.length; i += 2) {
+    if (p[i] < x0) x0 = p[i]
+    if (p[i] > x1) x1 = p[i]
+    if (p[i + 1] < y0) y0 = p[i + 1]
+    if (p[i + 1] > y1) y1 = p[i + 1]
   }
-  for (let i = 0; i < n; i++) cells[i].length = 0
-  for (const u of S.units) {
-    const cx = clamp((u.x / CELL) | 0, 0, cw - 1)
-    const cy = clamp((u.y / CELL) | 0, 0, ch - 1)
-    cells[cy * cw + cx].push(u)
+  if (p.length < 12 || hypot(x1 - x0, y1 - y0) < 45) {
+    p.length = 0
+    return
+  }
+  const r = recognise(S.pts)
+  S.pts.length = 0
+  if (r < 0) {
+    // The dashed box that used to shake red is gone, so this callout is the
+    // ONLY visual sign a stroke was rejected. Cutting it bought 5 bytes and
+    // left muted players with no feedback at all, which was a bad trade.
+    pop('NOT A RUNE', '#ff6a8a', 640, BOX.y - 46)
+    sfx('bad')
+    return
+  }
+  if (S.queue.length >= MAX_RUNES) {
+    // Full: refuse rather than silently drop the rune they just drew.
+    sfx('bad')
+    pop('NO SLOTS!', '#ffd76a', 640, BOX.y - 46)
+    return
+  }
+  S.queue.push(r)
+  S.snap = { r, t: 0 } // the clean glyph flashes, then it is stored (GDD 2.2)
+  sfx('snap', r)
+  if (S.intro && S.introStep < 1) {
+    S.introStep = 1
+    S.introT = 0
   }
 }
 
+/* ------------------------------ casting ----------------------------- */
 /**
- * Collect every unit within `r` px of (x,y) into the shared NEAR buffer and
- * return how many. Callback-free on purpose: a `fn` parameter meant allocating
- * a fresh closure for every castle, soldier and mage on every frame, and the
- * resulting GC pauses showed up as periodic 60-90 ms frame spikes.
+ * Barrier flavour from the combo's element — no extra matrix column needed.
+ * WIND -> stops projectiles, EARTH -> stops everything, ICE -> one-shot pillar.
  */
-const NEAR = []
-const near = (x, y, r) => {
-  const x0 = clamp(((x - r) / CELL) | 0, 0, cw - 1)
-  const x1 = clamp(((x + r) / CELL) | 0, 0, cw - 1)
-  const y0 = clamp(((y - r) / CELL) | 0, 0, ch - 1)
-  const y1 = clamp(((y + r) / CELL) | 0, 0, ch - 1)
-  const r2 = r * r
-  let n = 0
-  for (let cy = y0; cy <= y1; cy++) {
-    for (let cx = x0; cx <= x1; cx++) {
-      const list = cells[cy * cw + cx]
-      for (let i = 0; i < list.length; i++) {
-        const u = list[i]
-        const dx = u.x - x
-        const dy = u.y - y
-        if (dx * dx + dy * dy < r2) NEAR[n++] = u
-      }
+const guardKind = (q) => (q[0] === EARTH ? 1 : q[0] === ICE ? 2 : 0)
+
+/** Fire a spell. `e` = cast by Umbra. */
+const launch = (q, e) => {
+  const sp = spellFor(q)
+  const [name, kind, , ex] = sp
+  /**
+   * The player's damage is the only thing the meta-game touches: the element
+   * the cast LEANS ON is checked against the foe's, then scaled by the rank
+   * bought with coins. Umbra's own damage is left flat — she has no element
+   * to counter and no coins to spend, and letting her scale too would just
+   * cancel the upgrade the player paid for.
+   */
+  const dr = q[q.length - 1]
+  const mul = e ? 1 : elemMul(dr, FOES[S.foe][1]) * (1 + 0.12 * S.up[dr])
+  const dmg = sp[2] * mul
+  const key = [...q].sort().join('')
+  const hx = hornX(e)
+  const dir = e ? -1 : 1
+
+  castBurst(hx, HORN_Y, q[q.length - 1])
+  sfx('cast', q.length)
+  if (e) S.eCastAnim = 0.55
+  else S.castAnim = 0.55
+
+  if (kind === 2) {
+    // Barriers land on the caster, instantly.
+    const k = guardKind(q)
+    if (e) {
+      S.eGuard = ex
+      S.eGuardK = k
+    } else {
+      S.guard = ex
+      S.guardK = k
+    }
+    barrier(e ? UX : AX, GY - 70, q[0], ex)
+    sfx('guard')
+  } else {
+    S.shots.push({
+      x: hx,
+      y: HORN_Y,
+      tx: e ? AX : UX,
+      r: q[q.length - 1],
+      k: kind,
+      dmg,
+      ex,
+      dir,
+      w: mul > 1.2 ? 1 : 0, // super-effective, for the callout on impact
+      n: q.length,
+      delay: DELAY[kind],
+      life: 0,
+    })
+  }
+
+  if (!e) {
+    S.combo = q.length
+    // `seen` is still recorded — the spellbook (SPELLBOOK=1) reads it — but it
+    // no longer changes what the player is told. Announcing a FIRST cast
+    // differently only meant something while there was a book to look it up in.
+    if (!S.seen[key]) {
+      S.seen[key] = 1
+      save()
+    }
+    pop(name + (q.length > 1 ? '  x' + q.length : ''), RUNES[q[0]][0], 640, 250)
+    if (S.intro) {
+      S.intro = 0
+      S.introStep = 3
+      save()
     }
   }
-  return n
+  q.length = 0
 }
 
-/* ------------------------------ units ------------------------------- */
-
-const addUnit = (x, y, tr) => {
-  if (S.units.length >= UNIT_CAP) return
-  S.units.push({
-    x,
-    y,
-    vx: rand(-20, 20),
-    vy: rand(-20, 20),
-    ph: rnd() * TAU,
-    tr: tr || null,
-    ti: 1,
-    hp: 1,
-    hb: (rnd() * 6) | 0, // stable hue bucket, lets the bloom pass batch by colour
-    tg: null, // cached attack target
-    tgT: 0, // seconds until the target is re-acquired
-    // "Home": where this unit holds station when it has no conveyor. Set to
-    // the spawn hive, then to a trail's end once it has run one, so the swarm
-    // masses at the frontier instead of roaming the map on its own.
-    hx: x,
-    hy: y,
-  })
+/** Player pressed cast. Harmless when the queue is empty. */
+export const cast = () => {
+  if (S.phase !== PH_DUEL || !S.queue.length) return
+  launch(S.queue, 0)
 }
 
-/** Pick the trail that starts closest to a spawn point. */
-const trailFrom = (x, y) => {
-  let best = null
-  let bd = 90
-  for (const tr of S.trails) {
-    if (tr.p.length < 4) continue
-    const d = hypot(tr.p[0] - x, tr.p[1] - y)
-    if (d < bd) {
-      bd = d
-      best = tr
-    }
-  }
-  return best
-}
-
-/** After a trail ends, look for another one to hop onto (handles branching). */
-const hopTrail = (u) => {
-  let best = null
-  let bd = 70
-  for (const tr of S.trails) {
-    if (tr === u.tr || tr.p.length < 4) continue
-    const d = hypot(tr.p[0] - u.x, tr.p[1] - u.y)
-    if (d < bd) {
-      bd = d
-      best = tr
-    }
-  }
-  if (best) {
-    u.tr = best
-    u.ti = 1
-    return 1
-  }
-  return 0
-}
-
-const updateUnits = (dt) => {
-  const units = S.units
-  const acc = UNIT_SPD * 9
-  const boost = S.overload > 0 ? 1.5 : 1
-  const cloneP = CLONE_RATE * (S.overload > 0 ? 2.2 : 1) * dt
-
-  for (let i = units.length - 1; i >= 0; i--) {
-    const u = units[i]
-    let ax = 0
-    let ay = 0
-    let onTrail = 0
-    const tr = u.tr
-
-    if (tr && tr.p.length >= 4) {
-      const p = tr.p
-      const j = u.ti
-      if (j * 2 + 1 >= p.length) {
-        // Reached the end of the conveyor: hold the frontier, not the hive.
-        if (!hopTrail(u)) {
-          u.tr = null
-          u.hx = p[p.length - 2]
-          u.hy = p[p.length - 1]
-        }
-      } else if (!segLive(tr, j - 1)) {
-        // The segment under us went dark: pathing force is lost (GDD 3.3),
-        // and the unit mills where it was stranded.
-        u.tr = null
-        u.hx = u.x
-        u.hy = u.y
-      } else {
-        const tx = p[j * 2]
-        const ty = p[j * 2 + 1]
-        const dx = tx - u.x
-        const dy = ty - u.y
-        const d = hypot(dx, dy) || 1
-        if (d < 19) {
-          u.ti++
-          tr.use++
-        }
-        ax += (dx / d) * acc
-        ay += (dy / d) * acc
-        onTrail = 1
-        // Recursive cloning only happens on a healthy conveyor.
-        if (rnd() < cloneP && units.length < UNIT_CAP) {
-          addUnit(u.x + rand(-6, 6), u.y + rand(-6, 6), tr)
-          S.units[S.units.length - 1].ti = j
-        }
-      }
-    }
-
-    if (!onTrail) {
-      // Off-trail units only engage what is already ON TOP of them. They must
-      // NOT wander across the map and win the level on their own — the trail
-      // is the player's verb, so an undirected swarm has to mill about.
-      // Targets are cached: re-acquiring per unit per frame was O(units x foes).
-      u.tgT -= dt
-      // `st === ST_HIVE` also retires a castle the swarm just converted.
-      if (u.tgT <= 0 || !u.tg || u.tg.hp <= 0 || u.tg.st === ST_HIVE) {
-        u.tg = nearestTarget(u.x, u.y, LOOSE_RANGE)
-        u.tgT = 0.2 + rnd() * 0.25
-      }
-      const t = u.tg
-      if (t) {
-        const dx = t.x - u.x
-        const dy = t.y - u.y
-        const d = hypot(dx, dy) || 1
-        ax += (dx / d) * acc * 0.75
-        ay += (dy / d) * acc * 0.75
-      } else {
-        // Nothing in reach: hold station around `home` and mill. This is what
-        // stops an unattended swarm from conquering the map by itself.
-        const dx = u.hx - u.x
-        const dy = u.hy - u.y
-        const d = hypot(dx, dy) || 1
-        if (d > 64) {
-          ax += (dx / d) * acc * 0.55
-          ay += (dy / d) * acc * 0.55
-        } else {
-          ax += sin(S.t * 0.7 + u.ph) * acc * 0.2
-          ay += cos(S.t * 0.6 + u.ph) * acc * 0.2
-        }
-      }
-    }
-
-    u.vx = (u.vx + ax * dt) * 0.9
-    u.vy = (u.vy + ay * dt) * 0.9
-    const sp = hypot(u.vx, u.vy)
-    const cap = UNIT_SPD * boost * (onTrail ? TRAIL_BONUS : 1)
-    if (sp > cap) {
-      u.vx = (u.vx / sp) * cap
-      u.vy = (u.vy / sp) * cap
-    }
-    u.x += u.vx * dt
-    u.y += u.vy * dt
-    u.ph += dt * (4 + sp * 0.05)
-
-    // Soft walls.
-    if (u.x < 8) u.vx += 400 * dt
-    if (u.x > S.w - 8) u.vx -= 400 * dt
-    if (u.y < 8) u.vy += 400 * dt
-    if (u.y > S.h - 8) u.vy -= 400 * dt
-
-    if (u.hp <= 0) {
-      units.splice(i, 1)
-      DEATH.hue = rnd()
-      burst(u.x, u.y, 5, DEATH)
-    }
-  }
-}
-
+/* ----------------------------- resolution --------------------------- */
 /**
- * Boids over the spatial hash — alignment, cohesion and separation against a
- * unit's nearest handful of neighbours (GDD 2.1). Capping at 9 per cell keeps
- * this O(units) instead of O(units²) and matches the "nearest 5-8" rule.
+ * Does an active barrier of flavour `gk` stop a spell of `kind`?
+ *   earth (1) stops everything.
+ *   wind (0) stops anything PHYSICAL — bolts, pushes, and falling debris.
+ *     Fire Rain and friends are many small projectiles dropping out of the
+ *     sky, so an air shell deflects them; only ground-level fields (kind 1)
+ *     still creep underneath it.
+ *   ice pillar (2) eats a single incoming projectile; it is a wall, not a
+ *     roof, so things falling from above go straight over it.
  */
-const flock = (dt) => {
-  const push = 240 * dt
-  const coh = 0.9 * dt
-  const ali = 2.2 * dt
-  for (let c = 0; c < cells.length; c++) {
-    const list = cells[c]
-    const n = min(list.length, 9)
-    if (n > 1) {
-      // Cohesion + alignment toward the local cell average.
-      let sx = 0
-      let sy = 0
-      let svx = 0
-      let svy = 0
-      for (let a = 0; a < n; a++) {
-        const u = list[a]
-        sx += u.x
-        sy += u.y
-        svx += u.vx
-        svy += u.vy
-      }
-      sx /= n
-      sy /= n
-      svx /= n
-      svy /= n
-      for (let a = 0; a < n; a++) {
-        const u = list[a]
-        u.vx += (sx - u.x) * coh + (svx - u.vx) * ali
-        u.vy += (sy - u.y) * coh + (svy - u.vy) * ali
-      }
+const stops = (gk, kind) => gk === 1 || kind === 0 || kind === 4 || (!gk && kind === 3)
+
+/** Land a resolved spell on a duelist. `e` = it hits Umbra. */
+const strike = (s, e) => {
+  const gk = e ? S.eGuardK : S.guardK
+  const g = e ? S.eGuard : S.guard
+  const tx = e ? UX : AX
+
+  if (g > 0 && stops(gk, s.k)) {
+    // Blocked. Still loud — a block the player cannot see is a bug report.
+    impact(tx - s.dir * 58, GY - 90, gk === 1 ? EARTH : gk === 2 ? ICE : WIND, 0.35)
+    sfx('guard')
+    shakeAdd(0.12)
+    pop('BLOCKED', '#8ff0ff', tx, GY - 210)
+    if (gk === 2) {
+      // The pillar spends itself on one hit. Tear the shield visual down with
+      // it — fx owns its own timer and would otherwise keep shining.
+      if (e) S.eGuard = 0
+      else S.guard = 0
+      barrier(tx, GY - 70, ICE, 0)
     }
-    for (let a = 0; a < n; a++) {
-      const u = list[a]
-      for (let b = a + 1; b < n; b++) {
-        const v = list[b]
-        const dx = v.x - u.x
-        const dy = v.y - u.y
-        const d2 = dx * dx + dy * dy
-        if (d2 > 0.01 && d2 < UNIT_R * UNIT_R * 4) {
-          const d = Math.sqrt(d2)
-          const f = (push * (1 - d / (UNIT_R * 2))) / d
-          u.vx -= dx * f
-          u.vy -= dy * f
-          v.vx += dx * f
-          v.vy += dy * f
-        }
-      }
-    }
+    return
   }
+
+  const p = clamp(s.dmg / 40, 0.15, 1)
+  // fireRain is FIRE-flavoured art (burning blocks, orange sky wash), so it
+  // only fits a fire heavy. Firing it for every heavy made GLACIER and
+  // MOUNTAIN rain fire. Non-fire heavies get a full-power elemental impact.
+  if (s.k === 3 && s.r === FIRE) fireRain(tx, GY, p)
+  impact(tx, GY - 90, s.r, s.k === 3 ? 1 : p)
+  sfx('hit', p)
+  sfx('hurt', p)
+  shakeAdd(0.16 + p * 0.34)
+  flashAdd(0.1 + p * 0.2)
+
+  if (e) {
+    S.ehp = max(0, S.ehp - s.dmg)
+    S.eHurt = 0.3
+    if (s.ex && s.k === 1) S.eBurn = max(S.eBurn, s.ex)
+    if (s.ex && (s.k === 0 || s.k === 3)) S.eSlow = max(S.eSlow, s.ex)
+    if (s.k === 4) S.eForm = max(0, S.eForm - 0.5) // pushback disrupts casting
+  } else {
+    S.hp = max(0, S.hp - s.dmg)
+    S.hurt = 0.3
+    if (s.ex && s.k === 1) S.burn = max(S.burn, s.ex)
+    if (s.ex && (s.k === 0 || s.k === 3)) S.slow = max(S.slow, s.ex)
+  }
+  // A weakness the player cannot SEE landing is a weakness they will not learn
+  // to aim for, so the counter-hit says so in its own colour.
+  pop((s.w ? 'WEAK! -' : '-') + (s.dmg | 0), s.w ? '#7dffa8' : e ? '#ffd76a' : '#ff6a8a', tx, GY - 250)
+  if (s.n > 1 && e) pop('x' + s.n + ' COMBO', '#fff', tx, GY - 300)
 }
 
-/* ----------------------------- castles ------------------------------ */
-
-const soldierEvery = () => (S.region < 1 ? 0 : max(1.5, 5.4 - S.region * 0.55))
-
-const convert = (c) => {
-  c.st = ST_HIVE
-  c.conv = 1
-  S.cap += CAP_PER_HIVE
-  S.dust += 25
-  sfx('convert')
-  flashAdd(0.45)
-  shakeAdd(0.28) // glitterWave() adds its own on top of this
-  glitterWave(c.x, c.y)
-  for (let i = 0; i < 3; i++) ring(c.x, c.y, { hue: rnd(), r0: c.r, r1: 260 + i * 90, life: 0.7 + i * 0.2, w: 8 - i * 2 })
-  burst(c.x, c.y, 90, { hue: -1, spd: 320, life: 1.4, size: 3.4, grav: 60 })
-  hint('HIVE CONVERTED! Draw onward from it')
-}
-
-const updateCastles = (dt) => {
-  const rate = soldierEvery()
-  for (const c of S.castles) {
-    if (c.st === ST_HIVE) {
-      // A hive with an unbroken trail leaving it produces 30% faster — so a
-      // cut trail costs you throughput as well as flow.
-      c.spawn += dt * (c.main ? SPAWN_MAIN : SPAWN_HIVE) * (linked(c) ? LINK_BONUS : 1)
-      while (c.spawn >= 1) {
-        c.spawn--
-        const tr = trailFrom(c.x, c.y)
-        addUnit(c.x + rand(-c.r, c.r), c.y + rand(-c.r, c.r), tr)
-        if (rnd() < 0.12) sfx('spawn')
+const stepShots = (dt) => {
+  for (let i = S.shots.length; i--; ) {
+    const s = S.shots[i]
+    s.life += dt
+    if (s.delay > 0) {
+      // Fields and heavies hang over the target, then fall.
+      s.delay -= dt
+      s.x = s.tx
+      s.y = GY - 240
+      if (s.delay <= 0) {
+        strike(s, s.dir > 0)
+        S.shots.splice(i, 1)
       }
       continue
     }
-
-    // Grey castle: bleed soldiers at the player.
-    if (rate) {
-      c.spawn += dt
-      if (c.spawn > rate) {
-        c.spawn = 0
-        const a = rnd() * TAU
-        S.soldiers.push({
-          x: c.x + cos(a) * (c.r + 12),
-          y: c.y + sin(a) * (c.r + 12),
-          vx: 0,
-          vy: 0,
-          hp: SOLDIER_HP + S.region * 8,
-          ph: rnd() * TAU,
-          ang: 0,
-          atk: 0,
-        })
-      }
-    }
-
-    // Unicorns crash into the castle and feed the conversion meter.
-    let hitN = near(c.x, c.y, c.r + UNIT_R)
-    while (hitN--) {
-      const u = NEAR[hitN]
-      if (u.hp <= 0) continue
-      u.hp = 0
-      c.conv += wt(u) / CONV_NEED // 0..1 fraction; on-trail arrivals convert 50% harder
-      c.st = ST_CONV
-      if (rnd() < 0.25) {
-        SPARK.hue = rnd()
-        burst(u.x, u.y, 3, SPARK)
-      }
-    }
-    if (c.conv >= 1) convert(c)
+    s.x += SPD[s.k] * s.dir * dt
+    // Gentle arc so bolts read as thrown, not slid.
+    s.y = HORN_Y + (GY - 90 - HORN_Y) * clamp(abs(s.x - hornX(s.dir < 0)) / 700, 0, 1)
+    if ((s.dir > 0 && s.x >= s.tx) || (s.dir < 0 && s.x <= s.tx)) {
+      strike(s, s.dir > 0)
+      S.shots.splice(i, 1)
+    } else if (s.life > 4) S.shots.splice(i, 1)
   }
 }
 
-/* ---------------------------- soldiers ------------------------------ */
-
-const updateSoldiers = (dt) => {
-  const hive = S.hive
-  for (let i = S.soldiers.length - 1; i >= 0; i--) {
-    const s = S.soldiers[i]
-    // March on the main hive in a loose phalanx.
-    const dx = hive.x - s.x
-    const dy = hive.y - s.y
-    const d = hypot(dx, dy) || 1
-    s.ang = atan2(dy, dx)
-    const sp = SOLDIER_SPD * (1 + S.region * 0.05)
-    s.x += (dx / d) * sp * dt
-    s.y += (dy / d) * sp * dt
-    s.ph += dt * 6
-
-    // Contact: the swarm chews them, they cut down unicorns.
-    let hits = 0
-    let dmg = 0
-    let k = near(s.x, s.y, 18)
-    while (k--) {
-      const u = NEAR[k]
-      if (u.hp <= 0) continue
-      hits++
-      dmg += wt(u)
-      if (S.overload <= 0 && rnd() < 0.9 * dt) u.hp = 0
-    }
-    if (hits) {
-      s.hp -= UNIT_DMG * dmg * dt * (S.overload > 0 ? 3 : 1)
-      if (rnd() < 6 * dt) {
-        SPARK.hue = rnd()
-        burst(s.x, s.y, 3, SPARK)
-        sfx('hit')
-      }
-    }
-
-    if (s.hp <= 0) {
-      S.soldiers.splice(i, 1)
-      S.kills++
-      S.dust += 3
-      sfx('kill')
-      burst(s.x, s.y, 14, { mono: 1, spd: 150, life: 0.7, size: 2.6, grav: 140 })
-      burst(s.x, s.y, 10, { hue: rnd(), spd: 190, life: 0.6, size: 2.8 })
-      continue
-    }
-
-    // Reached the hive: chew on it.
-    if (d < hive.r + 14) {
-      const was = hive.hp
-      hive.hp -= SOLDIER_DMG * dt
-      // Discrete thump each time the hive loses another 40 HP, instead of a
-      // per-frame nudge — a continuous drip made the screen shake constantly
-      // for as long as anything was chewing on the hive.
-      if (((was / 40) | 0) !== ((hive.hp / 40) | 0)) shakeAdd(0.3)
-      if (rnd() < 3 * dt) burst(hive.x, hive.y, 4, { mono: 1, spd: 90, life: 0.5, size: 2 })
-      if (hive.hp <= 0 && S.scene === SC_PLAY) {
-        S.scene = SC_DEAD
-        S.over = 0
-        sfx('lose')
-        shakeAdd(1)
-        flashAdd(0.3)
-      }
-    }
-  }
-}
-
-/* ------------------------ mages / void wounds ----------------------- */
-
+/* ------------------------------ the NPC ----------------------------- */
 /**
- * Mage targeting — readable by construction.
- *
- * A mage always defends whichever castle is closest to falling, by severing
- * the supply line feeding it: it picks the live trail node nearest that castle
- * but far enough out (SEVER_GAP) to actually cut the approach rather than
- * landing on top of the walls. That makes the cast legible — the cut always
- * appears on the lane you are currently pushing down.
+ * Umbra forms runes on a timer and casts on intent, never on a coin flip:
+ * she answers what is actually on the field. Difficulty ramps with wins so
+ * a returning player meets a sharper opponent (retention, roadmap item 3).
  */
-const SEVER_GAP = 75
-/** Seconds of visible warning before a Void Wound lands. */
-export const TELEGRAPH = 1.6
+const think = (dt) => {
+  const lv = S.foe // rung on the ladder IS the tier: a new foe is a new brain
+  // The very first duel eases off. A beginner still fighting the gesture
+  // should not be dead before they understand the verb; measured, a 2.5s/rune
+  // hand won 18% of duels at full rate, which is where new players quit.
+  const first = S.wins || S.losses ? 1 : 0.8
+  const rate = (0.42 + lv * 0.085) * (S.eSlow > 0 ? 0.55 : 1) * first
+  // Commit to the next rune BEFORE forming it, so the ghost in her slot shows
+  // what is actually coming and the player has something to read.
+  if (S.eRune < 0) S.eRune = chooseRune()
+  S.eForm += dt * rate
+  if (S.eForm >= 1) {
+    S.eForm = 0
+    if (S.equeue.length < MAX_RUNES) S.equeue.push(S.eRune)
+    S.eRune = chooseRune()
+  }
 
-const mageTarget = () => {
-  // The castle the player is closest to converting.
-  let tc = null
-  let best = -1
-  for (const c of S.castles) {
-    if (!c.main && c.st !== ST_HIVE && c.conv > best) {
-      best = c.conv
-      tc = c
-    }
+  S.eThink -= dt
+  if (S.eThink > 0 || !S.equeue.length) return
+  S.eThink = 0.25
+
+  const q = S.equeue
+  const incoming = S.shots.some((s) => s.dir > 0)
+  const full = q.length >= MAX_RUNES
+
+  // Cast when it means something: a full hand, a defensive answer to a shot
+  // already in flight, or a finisher that would end the duel now.
+  const finisher = spellFor(q)[2] >= S.hp
+  // FROM TIER 2 SHE READS THE PLAYER'S SLOTS. Everything below tier 2 can only
+  // answer a shot that already exists, which is always a beat too late against
+  // a heavy — the wind-up is longer than the barrier. Watching the queue lets
+  // her raise the wall while the spell is still being drawn, so a player who
+  // telegraphs three runes of damage now meets a guard instead of a free hit.
+  const threat = lv >= 2 && S.queue.length >= 2 && spellFor(S.queue)[1] !== 2
+  // Reading the threat is only worth anything if she can ACT on it, and a
+  // half-built attack in hand cannot become a wall. So she DUMPS it and
+  // commits to EARTH — a lone EARTH is already a barrier, and `eRune` is the
+  // ghost the player can see, so the panic is legible rather than magic.
+  // Without this she could only ever guard in the accident of an empty queue.
+  if (threat && S.eGuard <= 0 && q.length && spellFor(q)[1] !== 2) {
+    q.length = 0
+    S.eRune = EARTH
+    S.eForm = max(S.eForm, 0.5)
   }
-  let bx = 0
-  let by = 0
-  let bd = 1e9
-  for (const tr of S.trails) {
-    const p = tr.p
-    if (p.length < 6) continue
-    for (let i = 0, j = 0; i < p.length; i += 2, j++) {
-      if (tr.cut[j]) continue // already severed here
-      const x = p[i]
-      const y = p[i + 1]
-      // Prefer the approach lane to the threatened castle; with no castle in
-      // play, fall back to cutting deep along the longest trail.
-      const dc = tc ? hypot(x - tc.x, y - tc.y) : 1e6 - j
-      if (dc < SEVER_GAP) continue
-      if (dc < bd) {
-        bd = dc
-        bx = x
-        by = y
-      }
-    }
-  }
-  return bd < 1e9 ? [bx, by] : null
+  const defend = (incoming || threat) && spellFor(q)[1] === 2 && S.eGuard <= 0
+  if (full || defend || finisher || (q.length === 2 && rnd() < 0.02 + lv * 0.02)) launch(q, 1)
 }
 
-const updateMages = (dt) => {
-  for (let i = S.mages.length - 1; i >= 0; i--) {
-    const m = S.mages[i]
-    m.ph += dt
-    m.cast -= dt
-
-    let hits = 0
-    let dmg = 0
-    let k = near(m.x, m.y, 24)
-    while (k--) {
-      const u = NEAR[k]
-      if (u.hp <= 0) continue
-      hits++
-      dmg += wt(u)
-      if (S.overload <= 0 && rnd() < 0.9 * dt) u.hp = 0
-    }
-    if (hits) {
-      m.hp -= UNIT_DMG * dmg * dt * 0.6 * (S.overload > 0 ? 3 : 1)
-      if (rnd() < 5 * dt) burst(m.x, m.y, 3, { hue: rnd(), spd: 100, life: 0.4, size: 2 })
-    }
-    if (m.hp <= 0) {
-      S.mages.splice(i, 1)
-      S.kills++
-      S.dust += 12
-      sfx('kill')
-      burst(m.x, m.y, 30, { mono: 1, spd: 190, life: 0.9, size: 3, grav: 100 })
-      ring(m.x, m.y, { hue: 0.78, r0: 6, r1: 130, life: 0.5, w: 4 })
-      hint('Void Mage silenced')
-      continue
-    }
-
-    // Lock the target BEFORE firing and hold it, so render.js can telegraph
-    // the strike. The player gets ~TELEGRAPH seconds to reroute or Overload.
-    if (m.cast <= TELEGRAPH && !m.aim) m.aim = mageTarget()
-
-    if (m.cast <= 0) {
-      const t = m.aim
-      m.aim = null
-      m.cast = MAGE_CAST + rand(-0.6, 0.6)
-      if (t) {
-        const dx = t[0] - m.x
-        const dy = t[1] - m.y
-        const d = hypot(dx, dy) || 1
-        S.bolts.push({ x: m.x, y: m.y - 18, vx: (dx / d) * 210, vy: (dy / d) * 210, life: d / 210 })
-        burst(m.x, m.y - 18, 8, { mono: 1, spd: 60, life: 0.6, size: 2.4 })
-      }
-    }
-  }
+/** Which rune Umbra reaches for, given the state of the duel. */
+const chooseRune = () => {
+  const q = S.equeue
+  const el = FOES[S.foe][1]
+  // A lone EARTH already IS a barrier, so under a read threat it is the
+  // fastest wall she can put up — one rune, no combo to finish first.
+  if (S.foe >= 2 && S.queue.length >= 2 && S.eGuard <= 0 && !q.length) return EARTH
+  // Answer pressure with defence, otherwise build toward damage.
+  if (S.ehp < HP_MAX * 0.3 && S.eGuard <= 0 && !q.length && rnd() < 0.45) return pick([EARTH, ICE, WIND])
+  if (q.length === 1 && rnd() < 0.55) return q[0] // doubling up is the strong play
+  // A themed foe leans on its own element — that is what makes it readable,
+  // and therefore what makes its weakness worth learning.
+  return el < 0 || rnd() < 0.4 ? pick([FIRE, FIRE, ICE, ICE, EARTH, WIND]) : el
 }
 
-const updateBolts = (dt) => {
-  for (let i = S.bolts.length - 1; i >= 0; i--) {
-    const b = S.bolts[i]
-    b.x += b.vx * dt
-    b.y += b.vy * dt
-    b.life -= dt
-    if (rnd() < 26 * dt) burst(b.x, b.y, 2, { mono: 1, spd: 30, life: 0.5, size: 2.2 })
-    if (b.life <= 0 || b.x < 0 || b.y < 0 || b.x > S.w || b.y > S.h) {
-      S.bolts.splice(i, 1)
-      S.wounds.push({ x: b.x, y: b.y, r: WOUND_R, life: WOUND_LIFE, ml: WOUND_LIFE })
-      sfx('cut')
-      shakeAdd(0.26)
-      burst(b.x, b.y, 34, { mono: 1, spd: 210, life: 0.9, size: 3 })
-      ring(b.x, b.y, { hue: 0.75, r0: 4, r1: WOUND_R * 2, life: 0.45, w: 5, mono: 1 })
-      hint('Trail cut! Reroute, or SPACE to Overload')
-    }
+/* ------------------------------- update ----------------------------- */
+const tick = (dt) => {
+  // Damage over time, applied smoothly rather than in visible chunks.
+  if (S.burn > 0) {
+    S.burn -= dt
+    S.hp = max(0, S.hp - 4 * dt)
+    S.hurt = max(S.hurt, 0.06)
+  }
+  if (S.eBurn > 0) {
+    S.eBurn -= dt
+    S.ehp = max(0, S.ehp - 4 * dt)
+    S.eHurt = max(S.eHurt, 0.06)
+  }
+  // Written out rather than looped over a name table: property mangling in the
+  // release build renames S.guard etc., but a string 'guard' in a table would
+  // not follow, so the dynamic form silently stopped decrementing.
+  if (S.guard > 0) S.guard -= dt
+  if (S.eGuard > 0) S.eGuard -= dt
+  if (S.slow > 0) S.slow -= dt
+  if (S.eSlow > 0) S.eSlow -= dt
+  S.castAnim = max(0, S.castAnim - dt)
+  S.eCastAnim = max(0, S.eCastAnim - dt)
+  S.hurt = max(0, S.hurt - dt)
+  S.eHurt = max(0, S.eHurt - dt)
+  if (S.snap) {
+    S.snap.t += dt
+    if (S.snap.t > 0.45) S.snap = null
   }
 }
 
-const updateWounds = (dt) => {
-  for (let i = S.wounds.length - 1; i >= 0; i--) {
-    const w = S.wounds[i]
-    w.life -= dt
-    if (w.life <= 0) {
-      S.wounds.splice(i, 1)
-      burst(w.x, w.y, 12, { hue: rnd(), spd: 120, life: 0.7, size: 2.4 })
-    }
-  }
-}
-
-/* ---------------------------- overload ------------------------------ */
-
-export const overload = () => {
-  if (S.scene !== SC_PLAY) return 0
-  if (S.overload > 0) return 0
-  if (S.dust < OVERLOAD_COST) {
-    hint('Not enough Glitter Dust')
-    return 0
-  }
-  S.dust -= OVERLOAD_COST
-  S.overload = OVERLOAD_TIME
-  const x = S.hive.x
-  const y = S.hive.y
-  // Purge every Void Wound on the map.
-  for (const w of S.wounds) burst(w.x, w.y, 26, { hue: rnd(), spd: 240, life: 0.9, size: 3 })
-  S.wounds.length = 0
-  glitterWave(x, y)
-  flashAdd(0.9)
-  shakeAdd(1)
-  sfx('overload')
-  // Blast the front line back.
-  for (const s of S.soldiers) {
-    const d = hypot(s.x - x, s.y - y) || 1
-    s.hp -= 40
-    s.x += ((s.x - x) / d) * 40
-    s.y += ((s.y - y) / d) * 40
-  }
-  hint('OVERLOAD! The swarm is invincible')
-  return 1
-}
-
-/* ------------------------------ frame ------------------------------- */
-
-export const step = (dt) => {
-  if (S.scene !== SC_PLAY) return
-  S.overload = max(0, S.overload - dt)
-
-  rebuildGrid()
-  for (const tr of S.trails) tr.use = 0
-
-  updateCuts()
-  updateUnits(dt)
-  flock(dt)
-  updateCastles(dt)
-  updateSoldiers(dt)
-  updateMages(dt)
-  updateBolts(dt)
-  updateWounds(dt)
-  pruneTrails()
-  setSwarm(S.units.length)
-
-  // Victory: every grey castle is now a neon hive.
-  let left = 0
-  for (const c of S.castles) if (!c.main && c.st !== ST_HIVE) left++
-  if (!left && S.scene === SC_PLAY) {
-    S.scene = SC_CLEAR
-    S.over = 0
-    S.conquered = max(S.conquered, S.region + 1)
-    sfx('win')
+/** End the duel once, and only once. */
+const finish = (won) => {
+  S.phase = won ? PH_WIN : PH_LOSE
+  S.over = 0
+  S.shots.length = 0
+  S.queue.length = 0
+  S.equeue.length = 0
+  if (won) {
+    S.wins++
+    // Coins ONLY come from wins, and a rung further up pays more — the reward
+    // curve has to outrun the difficulty curve or upgrading stops mattering.
+    const c = 12 + S.foe * 6
+    S.coins += c
+    if (S.foe < FOES.length - 1) S.foe++
+    if (!S.best || S.dur < S.best) S.best = S.dur
+    rainbowBurst(UX, GY - 120)
     flashAdd(0.7)
-    for (let i = 0; i < 5; i++) ring(S.w / 2, S.h / 2, { hue: rnd(), r0: 10, r1: 700 + i * 120, life: 1 + i * 0.2, w: 10 - i })
+    pop('VICTORY', '#ffe98a', 640, 240)
+    pop('+' + c + ' COINS', '#ffd76a', 640, 300)
+  } else {
+    S.losses++
+    pop('DEFEATED', '#ff6a8a', 640, 240)
   }
+  shakeAdd(0.6)
+  sfx(won ? 'win' : 'lose')
+  save()
 }
 
-export { addUnit, near }
+/** Start (or restart) a duel without touching the meta-progress. */
+export const resetDuel = () => {
+  S.phase = PH_DUEL
+  S.hp = S.ehp = HP_MAX
+  S.queue.length = S.equeue.length = S.shots.length = S.pts.length = 0
+  S.eForm = S.guard = S.eGuard = S.burn = S.eBurn = S.slow = S.eSlow = 0
+  S.castAnim = S.eCastAnim = S.hurt = S.eHurt = S.draw = 0
+  S.dur = S.over = 0
+  S.eThink = 1.2 // a grace beat before Umbra opens
+  S.snap = null
+  S.sky = 0.5
+  S.round++
+}
+
+/** One simulation step. Called at a fixed timestep by main.js. */
+export const updateSim = (dt) => {
+  if (S.phase !== PH_DUEL) {
+    S.over += dt
+    setMood(S.phase === PH_WIN ? 1 : 0)
+    S.sky = damp(S.sky, S.phase === PH_WIN ? 1 : 0, 2.5, dt)
+    return
+  }
+  S.dur += dt
+  tick(dt)
+  stepShots(dt)
+  if (S.intro) {
+    // Beat 1 ("stored") reads for a moment, then hands over to beat 2 ("cast").
+    S.introT += dt
+    if (S.introStep === 1 && S.introT > 1.5) {
+      S.introStep = 2
+      S.introT = 0
+    }
+  } else think(dt)
+
+  // The sky IS the scoreboard (GDD 2.3): it tracks the HP balance, damped so
+  // a single bolt tilts the weather rather than snapping it.
+  const bal = 0.5 + (S.hp - S.ehp) / (2 * HP_MAX)
+  S.sky = damp(S.sky, clamp(bal, 0, 1), 1.4, dt)
+  setMood(S.sky)
+
+  if (S.ehp <= 0) finish(1)
+  else if (S.hp <= 0) finish(0)
+}

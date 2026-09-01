@@ -1,229 +1,142 @@
 /**
- * Render orchestration.
+ * render.js — one frame, in order. Owns the letterbox transform and nothing
+ * else; every module below draws in the 1280x720 stage space.
  *
- * Two canvases: the main one, and a quarter-resolution "glow" buffer that
- * every bright thing is also drawn into. Scaling that buffer back up with
- * smoothing gives real bloom for a handful of bytes and almost no GPU cost —
- * this is what makes the neon read as *light* instead of coloured lines.
+ * Order: sky -> island -> fx under -> shots -> duelists -> fx over -> the
+ * live stroke -> weather -> post -> HUD -> overlays.
  */
-import { S, TILE, SS, UNI_ROT, UNI_FRAMES, SOL_ROT, SOL_FRAMES, ST_HIVE, SC_MAP, rainbow } from './state.js'
-import { atan2, TAU, min, cos, sin, clamp } from './u.js'
-import { drawTerrain, drawWorldMap } from './world.js'
-import { drawTrails, drawWounds } from './trail.js'
-import { UNI, SOL, drawCastle, drawMage } from './sprites.js'
+import { S, SW, SH, BOX, AX, UX, GY, RUNES, PH_WIN, PH_LOSE, clamp } from './state.js'
+import { drawSky, drawIsland, drawWeather } from './arena.js'
+import { drawUnicorn } from './chars.js'
 import { drawFxUnder, drawFxOver, drawPost, shakeOffset } from './fx.js'
-import { TELEGRAPH } from './sim.js'
-import { drawHud, drawOverlays } from './ui.js'
+import { drawHud, drawOverlays, drawGlyph } from './ui.js'
+import { ease, min, TAU } from './u.js'
 
-/** Reused dash patterns — setLineDash allocates if given a fresh array. */
-const DASH = [7, 7]
-const NODASH = []
+/** Reused so a frame allocates nothing. */
+const AST = { cast: 0, hurt: 0, hp: 1, win: 0, lose: 0, form: 0 }
+const UST = { cast: 0, hurt: 0, hp: 1, win: 0, lose: 0, form: 0 }
 
-/* Dev-only per-stage profiler. DEBUG is a compile-time false in release, so
-   every call below is dead code the bundler removes. */
-export const PROF = {}
-/** Dev-only A/B switches so a stage's real cost can be isolated. */
-export const Q = { bloom: 1, units: 1, fx: 1, glow: 1 }
-const t0 = () => (DEBUG ? performance.now() : 0)
-const mark = (k, t) => {
-  if (DEBUG) PROF[k] = (PROF[k] || 0) * 0.88 + (performance.now() - t) * 0.12
+/** Letterbox: fit 1280x720 inside the viewport, centred. */
+export const layout = (w, h, dpr) => {
+  S.w = w
+  S.h = h
+  S.dpr = dpr
+  S.vs = min(w / SW, h / SH)
+  S.vx = (w - SW * S.vs) / 2
+  S.vy = (h - SH * S.vs) / 2
 }
 
-/** Bloom buffer downscale. 4 = cheap and soft. */
-const BS = 4
-let bc = null
-let bg = null
+/** Screen -> stage. Everything upstream of this works in stage units. */
+export const toStage = (x, y) => [(x - S.vx) / S.vs, (y - S.vy) / S.vs]
 
-/** Rainbow palette for the batched unit bloom pass. */
-const PAL = []
-for (let i = 0; i < 6; i++) PAL.push(`hsla(${i * 60},100%,62%,.26)`)
-
-export const initRender = () => {
-  bc = document.createElement('canvas')
-  bg = bc.getContext('2d')
-}
-
-export const resizeRender = () => {
-  bc.width = Math.ceil(S.w / BS)
-  bc.height = Math.ceil(S.h / BS)
-}
-
-const drawUnits = (g) => {
-  const c = UNI.c
-  const P = UNI.px // source tile, atlas pixels
-  const D = UNI.tile // destination tile, CSS px
-  const H = D / 2
-  for (const u of S.units) {
-    let r = Math.round((atan2(u.vy, u.vx) / TAU) * UNI_ROT) % UNI_ROT
-    if (r < 0) r += UNI_ROT
-    const f = (u.ph * 1.7) % UNI_FRAMES | 0
-    g.drawImage(c, r * P, f * P, P, P, u.x - H, u.y - H, D, D)
-  }
-}
-
-const drawSoldiers = (g) => {
-  const c = SOL.c
-  const P = SOL.px
-  const D = SOL.tile
-  const H = D / 2
-  for (const s of S.soldiers) {
-    let r = Math.round((s.ang / TAU) * SOL_ROT) % SOL_ROT
-    if (r < 0) r += SOL_ROT
-    const f = (s.ph * 0.9) % SOL_FRAMES | 0
-    g.drawImage(c, r * P, f * P, P, P, s.x - H, s.y - H, D, D)
-  }
-}
-
-/**
- * Void Wound telegraph: while a mage is winding up, show exactly where the cut
- * will land and how long you have. Without this the casts read as random.
- */
-const drawAim = (g) => {
-  for (const m of S.mages) {
-    const a = m.aim
-    if (!a) continue
-    const k = 1 - clamp(m.cast / TELEGRAPH, 0, 1) // 0 -> 1 as it closes
-    const r = 26 + (1 - k) * 34
-    g.strokeStyle = `rgba(190,110,255,${0.35 + k * 0.5})`
-    g.lineWidth = 2
-    g.setLineDash(DASH)
-    g.beginPath()
-    g.arc(a[0], a[1], r, 0, TAU)
-    g.stroke()
-    g.setLineDash(NODASH)
-    // Thin line back to the caster, so you can see WHICH mage is aiming.
-    g.beginPath()
-    g.moveTo(m.x, m.y - 18)
-    g.lineTo(a[0], a[1])
-    g.strokeStyle = `rgba(170,90,240,${0.16 + k * 0.34})`
-    g.lineWidth = 1.4
-    g.stroke()
-  }
-}
-
-const drawBolts = (g) => {
-  for (const b of S.bolts) {
-    g.fillStyle = '#0a0512'
-    g.beginPath()
-    g.arc(b.x, b.y, 7, 0, TAU)
-    g.fill()
-    g.strokeStyle = 'rgba(160,90,230,.9)'
-    g.lineWidth = 2
-    g.beginPath()
-    for (let i = 0; i < 5; i++) {
-      const a = (i / 4) * TAU + S.t * 6
-      g.lineTo(b.x + cos(a) * 11, b.y + sin(a) * 11)
-    }
-    g.stroke()
-  }
-}
-
-/** Everything that emits light, drawn into the low-res bloom buffer. */
-const drawGlow = (g) => {
+/** The stroke the player is drawing right now. */
+const drawStroke = (g) => {
+  const p = S.pts
+  if (p.length < 4) return
   g.save()
-  g.setTransform(1 / BS, 0, 0, 1 / BS, 0, 0)
-  g.clearRect(0, 0, S.w, S.h)
-  g.globalCompositeOperation = 'lighter'
-
-  drawTrails(g, 1)
-  drawWounds(g, 1)
-
-  // Units, batched into six hue passes so fillStyle changes six times, not 900.
-  for (let b = 0; b < 6; b++) {
-    g.fillStyle = PAL[b]
-    for (const u of S.units) {
-      if (u.hb === b) g.fillRect(u.x - 5, u.y - 5, 10, 10)
-    }
+  g.lineCap = g.lineJoin = 'round'
+  g.beginPath()
+  g.moveTo(p[0], p[1])
+  if (p.length < 8) {
+    for (let i = 2; i < p.length; i += 2) g.lineTo(p[i], p[i + 1])
+  } else {
+    // Quadratics through segment midpoints: each sample becomes a control
+    // point, so the curve passes smoothly along the pointer path instead of
+    // showing a corner at every sample. Cheap and allocation-free.
+    for (let i = 2; i < p.length - 2; i += 2)
+      g.quadraticCurveTo(p[i], p[i + 1], (p[i] + p[i + 2]) / 2, (p[i + 1] + p[i + 3]) / 2)
+    g.lineTo(p[p.length - 2], p[p.length - 1])
   }
-
-  // Hives are the brightest thing on the field.
-  for (const c of S.castles) {
-    if (c.st !== ST_HIVE && !c.conv) continue
-    const k = c.st === ST_HIVE ? 1 : c.conv
-    g.fillStyle = rainbow((S.t * 0.15 + c.seed) % 1, 60, 0.3 * k)
-    g.beginPath()
-    g.arc(c.x, c.y, c.r * (2.2 + 0.25 * sin(S.t * 3)), 0, TAU)
-    g.fill()
-  }
-
-  drawFxOver(g)
+  g.lineWidth = 17
+  g.strokeStyle = '#1a1030'
+  g.stroke()
+  g.lineWidth = 9
+  g.strokeStyle = '#fff'
+  g.stroke()
   g.restore()
 }
 
-export const frame = (g) => {
-  g.setTransform(S.dpr, 0, 0, S.dpr, 0, 0)
-
-  if (S.scene === SC_MAP) {
-    drawWorldMap(g, S.t)
-    drawOverlays(g)
-    return
+/** Spells in flight: a cel-shaded blob with a hard outline. */
+const drawShots = (g) => {
+  for (const s of S.shots) {
+    const [col, lit] = RUNES[s.r]
+    const r = (s.k === 3 ? 30 : s.k === 1 ? 24 : 17) * (1 + 0.12 * Math.sin(S.t * 22))
+    g.save()
+    g.translate(s.x, s.y)
+    // Delayed spells hang overhead and pulse a warning before they fall.
+    if (s.delay > 0) g.globalAlpha = 0.55 + 0.45 * Math.sin(S.t * 14)
+    g.beginPath()
+    g.arc(0, 0, r, 0, TAU)
+    g.fillStyle = col
+    g.fill()
+    g.lineWidth = 5
+    g.strokeStyle = '#1a1030'
+    g.stroke()
+    g.beginPath()
+    g.arc(-r * 0.3, -r * 0.3, r * 0.34, 0, TAU)
+    g.fillStyle = lit
+    g.fill()
+    g.restore()
   }
+}
 
-  const [sx, sy] = shakeOffset()
+/** The clean rune flashing before it is stored (GDD 2.2). */
+const drawSnap = (g) => {
+  if (!S.snap) return
+  const k = clamp(S.snap.t / 0.45, 0, 1)
+  drawGlyph(g, S.snap.r, BOX.x + BOX.w / 2, BOX.y + BOX.h / 2, 96 * (1 + ease(k) * 0.5), 1 - k)
+}
 
-  // Bloom is the first thing sacrificed when the frame budget is blown: it is
-  // pure polish, and the trails/units still read without it.
-  const bloom = S.q && (!DEBUG || Q.glow)
+export const render = (g) => {
+  const t = S.t
+  // The canvas backing store is CSS size x dpr, so EVERY transform here must
+  // carry dpr. Omitting it drew the stage into the top-left 1/dpr of the
+  // canvas while input still mapped clicks in CSS pixels — the ink landed
+  // away from the cursor and no button was ever hittable.
+  const d = S.dpr
+  g.setTransform(1, 0, 0, 1, 0, 0)
+  g.clearRect(0, 0, S.w * d, S.h * d)
 
-  let t = t0()
-  if (bloom) drawGlow(bg)
-  mark('glow', t)
+  // Letterbox bars stay black; the stage is centred inside them.
+  g.fillStyle = '#07060f'
+  g.fillRect(0, 0, S.w * d, S.h * d)
 
+  const so = shakeOffset()
+  const k = S.vs * d
+  g.setTransform(k, 0, 0, k, (S.vx + so[0] * S.vs) * d, (S.vy + so[1] * S.vs) * d)
   g.save()
-  g.translate(sx, sy)
+  g.beginPath()
+  g.rect(0, 0, SW, SH)
+  g.clip()
 
-  t = t0()
-  drawTerrain(g, S.t)
-  mark('terrain', t)
-
+  drawSky(g, t)
+  drawIsland(g)
   drawFxUnder(g)
-  drawWounds(g, 0)
 
-  t = t0()
-  drawTrails(g, 0)
-  mark('trails', t)
+  AST.cast = clamp(S.castAnim / 0.55, 0, 1)
+  AST.hurt = S.hurt
+  AST.hp = S.hp / 100
+  AST.win = S.phase === PH_WIN ? clamp(S.over, 0, 1) : 0
+  AST.lose = S.phase === PH_LOSE ? clamp(S.over, 0, 1) : 0
+  AST.form = S.queue.length / 3
+  UST.cast = clamp(S.eCastAnim / 0.55, 0, 1)
+  UST.hurt = S.eHurt
+  UST.hp = S.ehp / 100
+  UST.win = S.phase === PH_LOSE ? clamp(S.over, 0, 1) : 0
+  UST.lose = S.phase === PH_WIN ? clamp(S.over, 0, 1) : 0
+  UST.form = S.eForm
 
-  t = t0()
-  for (const c of S.castles) drawCastle(g, c, S.t)
-  for (const m of S.mages) drawMage(g, m, S.t)
-  drawAim(g)
-  drawSoldiers(g)
-  drawBolts(g)
-  mark('struct', t)
+  drawUnicorn(g, AX, GY, -1, AST, t)
+  drawUnicorn(g, UX, GY, 1, UST, t)
 
-  t = t0()
-  if (!DEBUG || Q.units) drawUnits(g)
-  mark('units', t)
-
-  t = t0()
-  if (!DEBUG || Q.fx) drawFxOver(g)
-  mark('fx', t)
-
-  // Bloom composite.
-  t = t0()
-  if (bloom) {
-  g.globalCompositeOperation = 'lighter'
-  g.imageSmoothingEnabled = true
-  // ONE full-screen additive pass, not two. Each pass blends every pixel on
-  // screen, and profiling put the old second (halo) pass at ~5.5 ms of an
-  // 18 ms frame at 900 units — by far the most expensive thing in the game.
-  // The halo is recovered for free by blurring the source instead: the buffer
-  // is drawn slightly oversized so its own bilinear upscale spreads the light.
-  g.globalAlpha = 0.78
-  if (!DEBUG || Q.bloom) g.drawImage(bc, -S.w * 0.008, -S.h * 0.008, S.w * 1.016, S.h * 1.016)
-  g.globalAlpha = 1
-  g.globalCompositeOperation = 'source-over'
-  }
-  mark('bloom', t)
-
+  drawShots(g)
+  drawFxOver(g)
+  drawSnap(g)
+  if (S.draw) drawStroke(g)
+  drawWeather(g, t)
+  drawPost(g)
   g.restore()
 
-  t = t0()
-  drawPost(g)
-  mark('post', t)
-
-  t = t0()
-  drawHud(g)
-  drawOverlays(g)
-  mark('ui', t)
+  drawHud(g, t)
+  drawOverlays(g, t) // reads S.dt itself for popup ageing
 }

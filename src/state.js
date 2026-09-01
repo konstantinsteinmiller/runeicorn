@@ -1,179 +1,278 @@
 /**
- * SHARED CONTRACT — every module imports from here. Do not add per-module
- * globals; hang shared data off `S`.
+ * SHARED CONTRACT — every module imports from here.
  *
- * Coordinate system: CSS pixels of the viewport. One region = one screenful,
- * no scrolling. Layout is authored in normalized 0..1 space (`nx`,`ny`) and
- * projected to pixels on every resize, so everything is responsive by default.
+ * ALL game state lives in ONE object: `unicorn_state` (exported also as `S`,
+ * which is just a short alias for the same reference). Nothing else may hold
+ * mutable game state. Persistence is a SINGLE localStorage key holding a tiny
+ * subset of it (see `save`/`load`), so we never litter storage.
  *
- * ART DIRECTION (from the storyboard):
- *   The Grim Empire is a pencil sketch — greys, hatching, jittered strokes,
- *   paper grain. The infection is pure neon: additive rainbow, bloom, glitter.
- *   Nothing colourful exists that the player did not cause.
+ * COORDINATES
+ *   Everything is laid out in a virtual 1280x720 stage. render.js computes one
+ *   letterbox transform (`S.vx, S.vy, S.vs`) so every module can work in stage
+ *   units and the game fits any viewport identically. Pointer coords are
+ *   converted to stage space by main.js before anything sees them.
+ *
+ * ART DIRECTION (from the storyboard)
+ *   Hand-drawn CEL SHADING: flat colour fills with thick black outlines, no
+ *   gradients on characters. Two chibi unicorns on a floating mossy island —
+ *   AURORA (white/gold, cute, heroic) on the left, UMBRA (matte black/purple,
+ *   sleepy-menacing) on the right. The sky is the scoreboard: heavy grey storm
+ *   while even, thinning toward a rainbow as you win, blackening to rain as you
+ *   lose.
  */
-import { TAU, sin, cos, hypot } from './u.js'
+import { sin, TAU, clamp } from './u.js'
 
-/* ----------------------------- scenes ----------------------------- */
-export const SC_PLAY = 0
-export const SC_CLEAR = 1 // region conquered
-export const SC_DEAD = 2 // main hive destroyed
-export const SC_MAP = 3 // world map (storyboard panel 8)
+/* ------------------------------ stage ------------------------------ */
+export const SW = 1280
+export const SH = 720
+/** The transparent drawing box: the central third of the stage (GDD 3.2). */
+export const BOX = { x: 470, y: 168, w: 340, h: 300 }
 
-/* ------------------------- castle states -------------------------- */
-export const ST_GREY = 0
-export const ST_CONV = 1 // conversion meter filling
-export const ST_HIVE = 2 // neon rainbow hive
+/* --------------------------- the duelists -------------------------- */
+/** Ground line: the island rim in arena.js. The hooves stand here. */
+export const GY = 508
+/* The island spans x 326..954 (arena.js IX/IW) and the drawing box takes
+   470..810, so the duelists live in the two strips left over. Any wider and
+   they float off the rim; any narrower and they collide with the box. */
+export const AX = 400 // Aurora, left
+export const UX = 880 // Umbra, right
+/** Horn tip, where spells are born — offset from the hooves. Measured from
+    the rendered rig: Aurora's tip sits at (x+58, y-168), Umbra's (larger head)
+    at (x-61, y-174); one symmetric pair covers both within a few units. */
+export const HDX = 59
+export const HDY = -170
 
-/* --------------------------- tuning ------------------------------- */
-// Ceiling on live mini-unicorns. Lowered from 900 when the sprites doubled in
-// size: each unit now covers 4x the pixels, so a packed swarm blends the same
-// pixels dozens deep and overdraw — not draw-call count — becomes the limit.
-// 520 big unicorns fill the screen exactly as much as 900 small ones did, and
-// you can actually tell they are unicorns.
-export const UNIT_CAP = 520
-export const PART_CAP = 620 // hard ceiling on particles
-export const UNIT_SPD = 132 // px/s base follow speed
-// Separation radius. Kept in step with the sprite size (UNI_SCALE) — at 52 CSS
-// px a 10 px spacing packed the swarm into an unreadable mass.
-export const UNIT_R = 9
-export const SPAWN_MAIN = 4.6 // units/s from the main hive
-export const SPAWN_HIVE = 2.4 // units/s from a converted hive
-export const CLONE_RATE = 0.7 // clones per unit per second on a healthy trail
-export const UNIT_DMG = 26 // contact damage per second
-/** Unicorns that must crash into a castle to flip it. Tuned so the FIRST
- *  conversion lands early — that reward is what starts the snowball. */
-export const CONV_NEED = 72
-export const CAP_BASE = 2400 // starting prismatic capacity (px of trail)
-export const CAP_PER_HIVE = 900 // capacity gained per converted hive
-export const OVERLOAD_COST = 60 // glitter dust per Overload Glitter Wave
-export const OVERLOAD_TIME = 3 // seconds of swarm invincibility
-export const SOLDIER_HP = 60
-export const SOLDIER_SPD = 26
-export const SOLDIER_DMG = 7 // damage per second to the hive
-export const MAGE_CAST = 7 // seconds between Void Wound casts
-export const WOUND_R = 58 // Void Wound radius
-// Wounds must expire well before the next cast, or the trail is dead more
-// often than it is alive and the swarm can never snowball.
-export const WOUND_LIFE = 5.5
-export const HIVE_HP = 160
+/* ------------------------------ phases ----------------------------- */
+export const PH_DUEL = 0
+export const PH_WIN = 1
+export const PH_LOSE = 2
 
-/** Sprite atlas geometry — sprites.js builds it, render.js blits it. */
-export const TILE = 26 // base CSS px per tile
-export const SS = 2 // atlas supersample factor
-/** Per-atlas size multipliers. Each sheet is rasterised at its own resolution
- *  (not upscaled at blit time), so bigger sprites stay crisp. */
-export const UNI_SCALE = 2 // mini-unicorns: 52 CSS px
-export const SOL_SCALE = 1.5 // grey soldiers: 39 CSS px
-export const UNI_ROT = 16 // unicorn rotation steps
-export const UNI_FRAMES = 6 // unicorn run-cycle frames
-export const SOL_ROT = 8
-export const SOL_FRAMES = 4
+/* ------------------------------ runes ------------------------------ */
+/* id, name, glyph, colour — the four primitives of GDD 3.2. */
+export const FIRE = 0
+export const WIND = 1
+export const ICE = 2
+export const EARTH = 3
+/* [base, light] per rune. The names used to live here too and nothing ever
+   read them — every spell name the player sees comes from SPELLS. */
+export const RUNES = [
+  ['#ff5a2b', '#ffb066'],
+  ['#8ff0ff', '#d9ffff'],
+  ['#59b6ff', '#cfe9ff'],
+  ['#b08050', '#e0c39a'],
+]
 
-/* ---------------------------- state ------------------------------- */
-export const S = {
-  /* viewport */
+/* --------------------------- spell matrix -------------------------- */
+/**
+ * Full GDD §4 matrix. Key = sorted rune ids joined, e.g. '0' , '00', '03'.
+ * [name, kind, damage, extra]
+ *   kind: 0 bolt (fast projectile) · 1 field (delayed area) · 2 barrier
+ *         3 heavy (delayed, big) · 4 push
+ *   extra: dot seconds / barrier seconds / slow seconds, per spell
+ */
+export const SPELLS = {
+  0: ['FIRE BOLT', 0, 8, 0],
+  '00': ['FIRE STORM', 1, 14, 3],
+  '000': ['FIRE RAIN', 3, 30, 0],
+  1: ['BOLT', 4, 5, 0],
+  11: ['WIND WALL', 2, 0, 6],
+  111: ['CYCLONE', 4, 16, 0],
+  2: ['ICE BOLT', 0, 8, 0],
+  22: ['PILLAR', 2, 0, 4],
+  222: ['BLIZZARD', 1, 22, 3],
+  3: ['EARTH WALL', 2, 0, 2],
+  33: ['EARTH SHARD', 0, 16, 0],
+  333: ['BOULDER', 3, 34, 0],
+  '01': ['FIRE BALL', 0, 16, 0],
+  '02': ['WET BALL', 0, 20, 2],
+  '03': ['MAGMA SHARD', 0, 15, 2],
+  12: ['FROST GALE', 1, 14, 3],
+  13: ['SAND BLAST', 0, 13, 0],
+  23: ['GLACIER', 3, 24, 0],
+  '012': ['PRISM NOVA', 3, 32, 2],
+  '013': ['ASH STORM', 1, 24, 3],
+  '023': ['SHATTER', 3, 30, 0],
+  123: ['TEMPEST', 1, 26, 3],
+}
+/* NOTE: every key must be reachable, i.e. at most MAX_RUNES long. The
+   spellbook enumerates these keys, so a longer one would render a row no
+   player could ever unlock. (A 4-rune 'RUNE-ICORN' lived here and did exactly
+   that; GDD 4 lists no 4-rune combo either.) */
+/** Fallback for any unlisted combination — never leave the player with nothing. */
+export const WILD = ['WILD SURGE', 0, 11, 0]
+
+export const MAX_RUNES = 3
+export const HP_MAX = 100
+
+/* ----------------------------- the ladder --------------------------- */
+/**
+ * CTR[e] is the rune that COUNTERS element e: fire melts ice, ice freezes
+ * wind, wind erodes earth, earth smothers fire. One 4-cycle, so every themed
+ * foe has exactly one element that hurts and one that barely scratches — the
+ * whole exploit loop in four numbers.
+ */
+export const CTR = [3, 2, 0, 1]
+/**
+ * [name, element] up the ladder, one rung per win. Element -1 means NO
+ * weakness: Umbra opens the game before the player knows elements exist, and
+ * PRISM closes it with nothing to exploit, so the boss has to be out-played
+ * rather than counter-picked. The index doubles as the AI tier (see `think`).
+ */
+export const FOES = [
+  ['UMBRA', -1],
+  ['EMBER', FIRE],
+  ['ZEPHYR', WIND],
+  ['GLACE', ICE],
+  ['TERRA', EARTH],
+  ['PRISM', -1],
+]
+/**
+ * Damage scale for rune `r` against foe element `f`. The rune that counts is
+ * the LAST one drawn — which is already the one that colours the projectile
+ * and its impact, so the element the player sees flying is the element that
+ * gets the bonus. Counting the most-repeated rune instead was both dearer and
+ * a rule the screen never showed.
+ */
+export const elemMul = (r, f) => (f < 0 ? 1 : r === f ? 0.55 : CTR[f] === r ? 1.7 : 1)
+
+/* ------------------------------ state ------------------------------ */
+/**
+ * THE single game-state object. Everything mutable lives here.
+ * (Exported as both `unicorn_state` and the short alias `S`.)
+ */
+export const unicorn_state = {
+  /* viewport + stage transform */
   w: 0,
   h: 0,
   dpr: 1,
-  sc: 1, // UI scale factor, ~1 at 900px wide, clamped
-  t: 0, // seconds since boot
-  dt: 0, // clamped frame delta in seconds
+  vx: 0, // stage->screen offset
+  vy: 0,
+  vs: 1, // stage->screen scale
+  t: 0,
+  dt: 0,
 
   /* flow */
-  scene: SC_PLAY,
-  region: 0, // index of the region being played
-  conquered: 0, // highest region cleared
-  intro: 1, // title card visible until the first drag
-  help: 0, // tutorial overlay is up (modal)
-  over: 0, // seconds spent on the current end-of-scene overlay
+  phase: PH_DUEL,
+  over: 0, // seconds the end panel has been up
+  book: 0, // spellbook modal open
+  intro: 1, // onboarding still running
+  introStep: 0, // which onboarding beat we are on
+  introT: 0, // time on the current beat, so beat 1 can hand over to 2
+  round: 1,
 
-  /* entities */
-  units: [], // {x,y,vx,vy,ph,tr,ti,inv}
-  soldiers: [], // {x,y,vx,vy,hp,ph,ang}
-  mages: [], // {x,y,cast,ph,hp}
-  bolts: [], // {x,y,vx,vy,life}
-  wounds: [], // {x,y,r,life,ml}
-  castles: [], // {nx,ny,x,y,r,st,conv:0..1,hp,spawn,main,seed}
-  trails: [], // {p:[x,y,...],use,cut:[bool per node],src}
-  hive: null, // shortcut to the main hive castle
+  /* duelists */
+  hp: HP_MAX,
+  ehp: HP_MAX,
+  queue: [], // player rune ids, max MAX_RUNES
+  equeue: [], // NPC rune ids
+  eForm: 0, // 0..1 progress of the NPC's rune currently forming
+  /* Which rune that is (0..3, or -1 before the first pick). Umbra commits to
+     it up front so the player can READ her and counter — GDD 3.4 wants a
+     ghostly outline of the real rune, not a question mark. */
+  eRune: -1,
+  eThink: 1.2, // NPC decision cooldown
+  guard: 0, // player barrier seconds remaining
+  eGuard: 0,
+  /* Barrier flavour: 0 wind (stops projectiles) · 1 earth (stops everything)
+     · 2 ice pillar (stops one projectile, then shatters). Derived from the
+     combo's element in sim.js, so the matrix needs no extra column. */
+  guardK: 0,
+  eGuardK: 0,
+  burn: 0, // player DOT seconds
+  eBurn: 0,
+  slow: 0,
+  eSlow: 0,
+  castAnim: 0, // player cast pose timer
+  eCastAnim: 0,
+  hurt: 0,
+  eHurt: 0,
 
-  /* resources */
-  dust: 0,
-  cap: CAP_BASE,
-  capUsed: 0,
-  kills: 0,
-  overload: 0, // seconds of Overload still active
+  /* drawing */
+  draw: 0, // 1 while the pointer is down inside the box
+  pts: [], // raw stroke in stage coords
+  snap: null, // {rune, t} the clean rune flashing after a hit
 
-  /* input */
-  drawing: null, // the trail currently under the cursor
-  px: 0,
-  py: 0, // last pointer position
-  down: 0,
+  /* spells in flight */
+  shots: [], // {x,y,vx,vy,rune,dmg,kind,extra,dir,life,delay}
 
-  /* adaptive quality: 1 = full bloom, 0 = degraded on slow hardware */
-  q: 1,
-  fdt: 0.016, // smoothed frame time, seconds
+  /* scoring / meta */
+  foe: 0, // rung on the FOES ladder; also the NPC's AI tier
+  coins: 0, // spent on element ranks, earned only by winning
+  up: [0, 0, 0, 0], // per-element damage rank, +12% each
+  wins: 0,
+  losses: 0,
+  best: 0, // fastest win, seconds
+  dur: 0, // seconds this duel has run, for `best`
+  /* Spellbook discovery: key -> 1. The four single-rune spells start KNOWN —
+     they are the alphabet, not a secret, and a book that opens completely
+     blank teaches the player nothing about what they are looking for. */
+  seen: { 0: 1, 1: 1, 2: 1, 3: 1 },
+  combo: 0, // runes in the last cast, for the DAMAGE! xN COMBO callout
 
   /* feel */
   shake: 0,
   flash: 0,
-  hitStop: 0,
-  hint: '',
-  hintT: 0,
+  sky: 0.5, // 0 = losing/black storm, 1 = winning/rainbow
+  pops: [], // HUD callouts {s, c?, x?, y?}
+
+  /* adaptive quality */
+  q: 1,
+  fdt: 0.016,
   muted: 0,
 }
+/** Short alias. Same object — never reassign either binding. */
+export const S = unicorn_state
 
-/** Project normalized layout coords to pixels. Called on resize. */
-export const project = () => {
-  const m = 60 * S.sc
-  for (const c of S.castles) {
-    c.x = m + c.nx * (S.w - m * 2)
-    c.y = m + c.ny * (S.h - m * 2)
+/* --------------------------- persistence --------------------------- */
+/** ONE key. Only the handful of fields worth surviving a reload. */
+const KEY = 'ru'
+/* Every key here is QUOTED on purpose. The release build mangles property
+   names, and an unquoted `w:` becomes whatever terser picks that run — so the
+   save format would silently change shape on any edit and every player would
+   lose their wins, best time and spellbook on update. Quoted keys are exempt
+   from mangling, which pins the format. */
+export const save = () => {
+  try {
+    localStorage[KEY] = JSON.stringify({
+      'w': S.wins,
+      'l': S.losses,
+      'b': S.best,
+      's': S.seen,
+      'm': S.muted,
+      'i': S.intro ? 0 : 1,
+      'f': S.foe,
+      'c': S.coins,
+      'u': S.up,
+    })
+  } catch {
+    /* storage blocked — the game simply does not remember */
   }
-  for (const e of S.mages) {
-    e.x = m + e.nx * (S.w - m * 2)
-    e.y = m + e.ny * (S.h - m * 2)
+}
+export const load = () => {
+  try {
+    const o = JSON.parse(localStorage[KEY])
+    S.wins = o['w'] | 0
+    S.losses = o['l'] | 0
+    S.best = o['b'] || 0
+    // Merge, so the four base runes stay known even for an older save.
+    S.seen = { 0: 1, 1: 1, 2: 1, 3: 1, ...o['s'] }
+    S.muted = o['m'] | 0
+    S.intro = o['i'] ? 0 : 1
+    // clamp: a save written before the ladder existed has no 'f', and a hand
+    // -edited one must not index past the roster.
+    S.foe = clamp(o['f'] | 0, 0, FOES.length - 1)
+    S.coins = o['c'] | 0
+    if (o['u']) S.up = o['u']
+  } catch {
+    /* first visit, or storage blocked */
   }
 }
 
-/** Show a transient hint line under the HUD. */
-export const hint = (text, secs = 4) => {
-  S.hint = text
-  S.hintT = secs
-}
-
-/** Nearest live enemy target (castle or soldier) to a point, or null. */
-export const nearestTarget = (x, y, maxD = 1e9) => {
-  let best = null
-  let bd = maxD
-  for (const s of S.soldiers) {
-    const d = hypot(s.x - x, s.y - y)
-    if (d < bd) {
-      bd = d
-      best = s
-    }
-  }
-  for (const c of S.castles) {
-    if (c.st === ST_HIVE) continue
-    const d = hypot(c.x - x, c.y - y) - c.r
-    if (d < bd) {
-      bd = d
-      best = c
-    }
-  }
-  return best
-}
-
-/** Is this point inside an active Void Wound? */
-export const inWound = (x, y) => {
-  for (const w of S.wounds) if (hypot(w.x - x, w.y - y) < w.r) return w
-  return null
-}
-
-/** Rainbow helper: the infection's signature colour ramp. */
-export const rainbow = (v, l = 60, a = 1) => `hsla(${(v * 360) % 360},100%,${l}%,${a})`
-
-/** Cheap pulsing value for neon breathing. */
+/* ----------------------------- helpers ----------------------------- */
+export const rainbow = (v, l = 60, a = 1) =>
+  `hsla(${(((v * 360) % 360) + 360) % 360},100%,${l}%,${a})`
 export const pulse = (t, speed = 1) => 0.5 + 0.5 * sin(t * speed * TAU)
+/** Look up the spell for a queue of rune ids. */
+export const spellFor = (q) => SPELLS[[...q].sort().join('')] || WILD
 
-export { TAU, sin, cos }
+export { TAU, clamp }

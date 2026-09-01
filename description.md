@@ -1,48 +1,64 @@
-# Plague of Light: Rainbow Swarm
+# Rune-icorn Duels
 
-## Short description (max 150 chars)
+## Short description (150 char max)
 
-> Draw rainbow trails to steer a cloning unicorn swarm that floods a grim grey empire and converts its castles into blinding neon hives.
+Draw runes to duel a dark unicorn. Sketch fire, wind, ice and earth, stack three, and cast the combo before Umbra lands hers.
 
-`131 characters`
+<!-- 123 characters -->
 
-## Description (max 500 chars)
+## Description (500 char max)
 
-> The Grim Empire has a light problem. You are the swarm.
->
-> Drag to forge Rainbow Conveyor Trails and a horde of mini-unicorns pours down them, multiplying as it runs. Overwhelm grey phalanxes, crash into castles until they burst into neon hives, and watch the infection spread. Void Mages tear your trails apart with dark magic — reroute fast, or spend Glitter Dust on an Overload Glitter Wave and become unstoppable. No menus. No loading. Just light, everywhere.
+A gesture-driven magic duel. Draw a triangle for fire, a wave for wind, a Z for ice, a square for earth — rough shapes are fine, the recogniser is built to forgive. Stack up to three runes and cast them together: every combination is a different spell, from a quick Fire Bolt to a three-rune Prism Nova. Watch Umbra's runes forming above her horn and answer with a barrier, or just outrace her. The sky is the scoreboard — it clears to a rainbow as you win, and blackens to rain as you lose.
 
-`468 characters`
+<!-- 494 characters -->
 
 ## How to play
 
-Your Main Hive spawns mini-unicorns forever, but they have nowhere to go until you give them a road.
+You are Aurora, the white unicorn on the left. Umbra, on the right, is casting
+too — and she does not wait for you.
 
-1. **Draw a trail.** Drag out from a glowing hive. The swarm pours along it automatically. Without a trail your unicorns just hold station around the hive — the trail *is* the game.
-2. **Grow.** A rainbow trail is a genuine power-up. On it, unicorns clone themselves, move **50% faster**, hit **50% harder** and convert castles **50% quicker** — and any hive with an unbroken trail leaving it spawns **30% faster**.
-3. **Convert.** Steer the swarm into a grey castle. Every unicorn that crashes into it fills the conversion meter. Fill it and the castle detonates into a Rainbow Hive that spawns for *you* and raises your Prismatic Capacity.
-4. **Defend.** Grey Soldiers march on your Main Hive. If it falls, the region is lost. Your swarm is your only defence — route it through them.
-5. **React.** Void Mages defend whichever castle is closest to falling by severing the trail that feeds it. They **mark the spot first** — a pulsing purple reticle gives you about a second and a half to reroute before the Void Wound lands. Units on the dead segment stop cold, stop cloning, and the hive loses its speed bonus.
-6. **Overload.** Kills earn Glitter Dust. Spend it on an Overload Glitter Wave: every Void Wound on the map is purged, the front line is blasted back, and the swarm turns invincible for three seconds.
+1. **Draw a rune anywhere on the screen** — the faint dashed box is only a
+   suggestion of where to aim, not a boundary. Four shapes, one continuous
+   stroke each:
 
-Convert every castle to conquer the region and advance across the world map. Each region adds one new idea — soldiers, then mages, then pressure from every direction.
+   | Shape | Rune | Trail |
+   | :-- | :-- | :-- |
+   | Triangle | **Fire** | orange |
+   | Wavy line | **Wind** | cyan |
+   | **Z** zig-zag | **Ice** | blue |
+   | Square | **Earth** | brown |
 
-**Tips**
-- Trails can only start on a hive **or on an existing trail** — branch off a running trail to split your flow in two.
-- A looping trail that does not reach a castle is a *breeding pen*: unicorns keep cloning instead of dying on the walls. Build up, then extend the loop into the castle.
-- Long trails grow the swarm more, but they give mages a fatter target.
-- Do not spend Overload the instant you can afford it. Save it for the moment two trails get cut at once.
-- Converting a castle refills your capacity budget. Snowball toward the nearest castle first.
+   Direction and starting corner do not matter, and neither does neatness.
+   If a shape is not recognised the box shakes — just draw it again.
+
+2. **Stack up to three runes.** They fill the slots under your health bar.
+
+3. **Cast.** All stored runes fire as a *single* combined spell. One rune is
+   fast and cheap; three is slow to prepare but hits far harder. The CAST
+   button always shows the name of the spell you currently have loaded, so you
+   can see what you are about to throw before you throw it.
+
+4. **Defend when you must.** A square alone raises an Earth Barrier that stops
+   everything for 2s. Two waves raise a Wind Barrier that stops projectiles for
+   6s. Two Zs plant an Ice Pillar that eats exactly one projectile. Umbra's
+   forming rune is visible above her horn — that is your tell.
+
+5. **First to zero wins.** Your fastest victory is saved as your best time.
+
+**Tip:** repeating an element is the strong opening — two triangles is Fire
+Storm, three is Fire Rain. Mixing elements unlocks the rarer spells, and every
+new combination you discover is recorded in the spellbook.
 
 ## Controls
 
 | Action | Desktop | Touch |
-| --- | --- | --- |
-| Draw a Rainbow Trail | Click and drag from a hive or trail | Drag from a hive or trail |
-| Overload Glitter Wave | `SPACE` or the Overload button | Tap the Overload button |
-| Mute / unmute | `M` or the speaker icon | Tap the speaker icon |
-| How to play | `H` or the **?** button | Tap the **?** button |
-| Continue / retry | Click anywhere | Tap anywhere |
+| :-- | :-- | :-- |
+| Draw a rune | Click + drag anywhere | Drag anywhere |
+| Cast | **Space**, **Enter** or **E**, or the CAST button | Tap CAST |
+| Discard the queue | **X**, or the trash icon | Tap the trash icon |
+| Spellbook | **H** or **?**, or the book icon | Tap the book icon |
+| Mute | **M**, or the note icon | Tap the note icon |
+| Duel again | **Space** / click on the result panel | Tap the result panel |
 
-No installation, no menu — the game starts in the first region the moment it loads. A short
-tutorial shows once on your first visit and is always available again from the **?** button.
+Everything is on screen; nothing is hidden behind a menu. The game opens
+directly into the duel and teaches the core gesture in three wordless beats.

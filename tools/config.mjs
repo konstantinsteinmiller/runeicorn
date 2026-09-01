@@ -4,19 +4,64 @@
  */
 
 /** js13kGames hard limit: 13 * 1024 bytes for the final .zip */
-export const BUDGET = Number(process.env.BUDGET) || 13 * 1024
+/**
+ * POST-JAM. The jam ceiling was 13 * 1024 = 13,312 and the entry shipped under
+ * it (13,304 at commit e570fe2 + the leg rework). The elemental ladder, the
+ * tiered NPC and the coin progression were then added with the cap explicitly
+ * lifted, and TOGETHER THEY EXCEED IT — `BUDGET=13312 pnpm check` re-arms the
+ * old gate and this tree will fail it by design. To rebuild the jam entry,
+ * check out the jam commit; the number is recorded here, not preserved.
+ */
+/**
+ * Knobs arrive as EITHER an env var or a CLI flag. The flags exist because
+ * `VAR=1 node ...` in a package.json script is POSIX-only — pnpm runs scripts
+ * through cmd.exe on Windows, where that prefix is a syntax error rather than
+ * an assignment. build.mjs ignores arguments it does not recognise, so the
+ * extra flags cost it nothing.
+ */
+const argv = process.argv.slice(2)
+const has = (n) => argv.includes(n)
+const val = (n) => {
+  const p = argv.find((a) => a.startsWith(n + '='))
+  return p && p.slice(n.length + 1)
+}
+
+/**
+ * Byte budgets accept a raw count or a `k` suffix (`13312` / `13k`, 1k = 1024).
+ * The suffix is parsed rather than tolerated: `Number('13k')` is NaN, which the
+ * old `||` chain swallowed straight into the default — so `--budget=13k` worked
+ * only because the default happened to be the same number, and `--budget=20k`
+ * would have silently produced 13312 as well. Unparseable input now throws.
+ */
+const bytes = (v) => {
+  if (v == null || v === '' || v === false) return 0
+  const m = /^(\d+(?:\.\d+)?)(k|kb|kib)?$/i.exec(String(v).trim())
+  if (!m) throw new Error(`cannot parse byte budget ${JSON.stringify(v)} — use e.g. 13312 or 13k`)
+  return Math.round(Number(m[1]) * (m[2] ? 1024 : 1))
+}
+
+export const BUDGET = bytes(process.env.BUDGET) || bytes(val('--budget')) || 13 * 1024
+
+/**
+ * Output root. Portal builds go somewhere else than the jam build so the two
+ * never overwrite each other — `wavedash build push` uploads a DIRECTORY, and
+ * pointing it at `dist/` would ship whichever build ran last.
+ */
+const OUT = process.env.OUT || val('--out') || 'dist'
 
 export const PATHS = {
   // ENTRY/SHELL env overrides make it easy to size-test an alternative build.
   entry: process.env.ENTRY || 'src/main.js',
   shell: process.env.SHELL_HTML || 'src/index.html',
-  out: 'dist',
-  tmp: 'dist/.tmp',
+  out: OUT,
+  tmp: `${OUT}/.tmp`,
   /** file name INSIDE the zip — js13k requires index.html at the archive root */
   htmlName: 'index.html',
   zipName: 'game.zip',
-  /** cached roadroller parameters so repeat -O2 builds are fast */
-  paramCache: 'dist/.roadroller-params.json',
+  /** cached roadroller parameters so repeat -O2 builds are fast. Per OUT dir:
+      the portal payload differs from the jam payload, and parameters tuned for
+      one are merely valid — not optimal — for the other. */
+  paramCache: `${OUT}/.roadroller-params.json`,
 }
 
 /** Placeholder inside src/index.html that gets replaced with the payload. */
@@ -31,7 +76,7 @@ export const esbuildOptions = (mode /* 'release' | 'dev' */) => ({
   format: 'iife',
   // Modern-only target: no transpiled helpers, no polyfills, shortest output.
   // Safari 15, not 14: esbuild refuses to emit destructuring for Safari 14
-  // (it has a known engine bug) and cannot lower it either.
+  // (known engine bug) and cannot lower it either, so the build hard-fails.
   target: ['es2020', 'chrome80', 'firefox78', 'safari15'],
   // Emit real UTF-8 instead of \uXXXX escapes — smaller and roadroller-friendly.
   charset: 'utf8',
@@ -41,6 +86,21 @@ export const esbuildOptions = (mode /* 'release' | 'dev' */) => ({
   write: false,
   define: {
     DEBUG: mode === 'dev' ? 'true' : 'false',
+    /**
+     * FEATURE FLAG, not a deletion. The spellbook stays in the source and is
+     * compiled out — esbuild folds the constant, terser drops the dead
+     * branches, and tree-shaking then takes the modal and its KEYS table with
+     * it. `SPELLBOOK=1 pnpm build` puts it back.
+     */
+    SPELLBOOK: process.env.SPELLBOOK === '1' || has('--spellbook') ? 'true' : 'false',
+    /**
+     * PORTAL TARGET. Off for the jam build and it must stay that way: js13k
+     * requires a self-contained zip, and the Wavedash handshake talks to a
+     * `<script>` that Wavedash's own wrapper injects — an external resource
+     * the jam entry is not allowed to depend on. `WAVEDASH=1 pnpm
+     * build:wavedash` compiles the handshake in and writes a separate tree.
+     */
+    WAVEDASH: process.env.WAVEDASH === '1' || has('--wavedash') ? 'true' : 'false',
   },
   // Anything referenced through these is compile-time removed when DEBUG=false.
   pure: mode === 'dev' ? [] : ['console.log', 'console.warn', 'console.debug'],
@@ -62,6 +122,26 @@ export const RESERVED_PROPS = [
   'v',
   'best',
   'mute',
+  /**
+   * WAVEDASH SDK SURFACE — these cross a boundary we do not own, so mangling
+   * them renames one half of a call the other half still expects.
+   *
+   * This is not hypothetical: `--mangle-all-props` turned
+   * `sdk.updateLoadProgressZeroToOne` into `sdk.Tt`, and because the handshake
+   * calls it as `?.()`, a missing method is indistinguishable from a method
+   * that legitimately does not exist on an older wrapper. The call silently
+   * became a no-op, Wavedash's loading screen would have stayed up forever,
+   * and NOTHING would have appeared in the console.
+   *
+   * `init` and `debug` happen to survive today because terser recognises them,
+   * but they are pinned anyway — a name that only works by luck is a bug that
+   * has not fired yet.
+   */
+  'WavedashJS',
+  'init',
+  'debug',
+  'updateLoadProgressZeroToOne',
+  'readyForEvents',
 ]
 
 export const terserOptions = ({ squeeze = false, mangleAllProps = false } = {}) => {
@@ -158,6 +238,10 @@ export const roadrollerOptions = ({ squeeze = false } = {}) => ({
   // -O2 (~300 parameter sets) for release, -O1 (~30) for the fast path.
   level: squeeze ? 2 : 1,
   packer: {
+    // MEASURED CEILING, do not raise. A single pack at 1024 is ~16 B smaller,
+    // but `optimize()` packs hundreds of times and overflows roadroller's wasm
+    // heap partway through ("Start offset ... outside the bounds of the
+    // buffer"), so the whole build dies for 16 bytes. 400 is what survives.
     maxMemoryMB: squeeze ? 400 : 150,
     // Let the decoder use undeclared globals (CLI: --dirty). Saves ~10-25 B.
     // build.mjs re-packs without it if a free var collides with an element id.

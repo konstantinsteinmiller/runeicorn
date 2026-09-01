@@ -1,223 +1,242 @@
 /**
- * Plague of Light: Rainbow Swarm — boot, input, scene flow.
+ * main.js — boot, input, and the frame loop. Owns no game rules.
  *
- * No main menu by design: the world is already alive behind the title card,
- * and the card dissolves the moment the player draws their first trail.
+ * The game starts straight into the duel: no menu, no loading screen. Every
+ * asset is procedural, so the first frame is the game.
  */
-import {
-  S,
-  SC_PLAY,
-  SC_CLEAR,
-  SC_DEAD,
-  SC_MAP,
-  project,
-  hint,
-} from './state.js'
-import { min, max, clamp } from './u.js'
-import { buildAtlas } from './sprites.js'
-import { makeRegion, REGIONS } from './world.js'
-import { startTrail, extendTrail, endTrail } from './trail.js'
-import { step, overload } from './sim.js'
-import { updateFx } from './fx.js'
-import { initAudio, tickAudio, toggleMute, music, sfx } from './audio.js'
+import { S, PH_DUEL, load, save, clamp } from './state.js'
+import { layout, toStage, render } from './render.js'
+import { resetDuel, updateSim, strokeStart, strokeMove, strokeEnd, cast } from './sim.js'
+import { initAudio, tickAudio, music, toggleMute, resetAudio, sfx } from './audio.js'
+import { updateFx, resetFx } from './fx.js'
+import { resetArena } from './arena.js'
 import { layoutUI, uiHit, isUI } from './ui.js'
-import { initRender, resizeRender, frame, PROF, Q } from './render.js'
+import { min } from './u.js'
 
-// Queried, not taken from the `id=c` implicit global: toplevel mangling is
-// free to name one of its own variables `c` and would shadow it.
+/* `document.querySelector` and not the `c` global: terser mangles a toplevel
+   name to `c` and would shadow it, which has broken the release build before. */
 const cv = document.querySelector('canvas')
-const g = cv.getContext('2d')
-let last = 0
-let started = 0
+const g = cv.getContext('2d', { alpha: false })
 
-/* ------------------------------ layout ------------------------------ */
-
+/* ------------------------------ viewport ---------------------------- */
 const resize = () => {
-  // Capped at 1.5, not 2: this is a fill-rate bound game (900 sprites + an
-  // additive bloom composite), and a retina backing store costs ~1.8x the
-  // pixels for a difference the neon glow hides anyway.
-  S.dpr = min(1.5, devicePixelRatio || 1)
-  S.w = innerWidth
-  S.h = innerHeight
-  cv.width = (S.w * S.dpr) | 0
-  cv.height = (S.h * S.dpr) | 0
+  const w = innerWidth
+  const h = innerHeight
+  // Cap DPR: a 3x phone would rasterise 3x the pixels for no visible gain.
+  const dpr = min(devicePixelRatio || 1, 2)
+  cv.width = w * dpr
+  cv.height = h * dpr
+  cv.style.width = w + 'px'
+  cv.style.height = h + 'px'
+  g.setTransform(dpr, 0, 0, dpr, 0, 0)
+  layout(w, h, dpr)
   layoutUI()
-  project()
-  resizeRender()
+  resetArena() // sky/island caches are resolution-bound
+  resetFx()
+}
+addEventListener('resize', resize)
+
+/* -------------------------------- input ----------------------------- */
+let started = 0
+/** Browsers only allow audio after a gesture; the first input starts it. */
+const wake = () => {
+  if (started) return
+  started = 1
+  initAudio()
+  music(1)
 }
 
-/* ------------------------------ scenes ------------------------------ */
-
-const load = (i) => {
-  makeRegion(i)
-  project()
-  S.scene = SC_PLAY
-  S.over = 0
-  hint('Drag from a glowing hive', 6)
-}
-
-/** Advance past an end-of-scene panel. */
-const advance = () => {
-  if (S.scene === SC_CLEAR) {
-    S.scene = SC_MAP
-    S.over = 0
-    sfx('ui')
-  } else if (S.scene === SC_MAP) {
-    load(S.region + 1)
-  } else if (S.scene === SC_DEAD) {
-    load(S.region)
+const act = (a) => {
+  if (!a) return 1
+  sfx('ui')
+  // codes, not names — see uiHit
+  if (a === 1) cast()
+  else if (SPELLBOOK && a === 2) S.book = 1
+  else if (SPELLBOOK && a === 3) S.book = 0
+  else if (a === 9) {
+    toggleMute()
+    save()
+  } else if (a === 4) {
+    resetDuel()
+    resetAudio()
+  } else {
+    // Buy one rank of an element. Priced off the rank already held, so each is
+    // dearer than the last and the player has to pick a lane rather than
+    // levelling all four flat.
+    const i = a - 5
+    const c = 10 * (S.up[i] + 1)
+    if (S.coins >= c) {
+      S.coins -= c
+      S.up[i]++
+      save()
+    }
   }
-}
-
-/* ------------------------------ input ------------------------------- */
-
-const pos = (e) => {
-  S.px = e.clientX
-  S.py = e.clientY
-}
-
-/** Tutorial is shown once ever, then only on demand. Storage may be blocked. */
-const SEEN = 'pol_seen'
-const seen = (v) => {
-  try {
-    return v === undefined ? localStorage[SEEN] : (localStorage[SEEN] = v)
-  } catch {
-    // Storage blocked (file://, strict privacy modes): fail toward TEACHING.
-    // A new player who never sees the tutorial is a worse outcome than a
-    // returning player dismissing it again.
-    return ''
-  }
+  return 0
 }
 
 const down = (e) => {
-  initAudio()
-  if (!started) {
-    started = 1
-    music(1)
+  e.preventDefault()
+  wake()
+  const [x, y] = toStage(e.clientX, e.clientY)
+  if (!act(uiHit(x, y))) return
+  // Draw ANYWHERE that is not a button. Gating this on the central box made
+  // most of the screen silently dead, which reads as "the press didn't register".
+  if (isUI(x, y) || S.phase !== PH_DUEL) return
+  // Capture, so a stroke that wanders off the canvas (or off-screen) keeps
+  // delivering moves and still ends with a real pointerup.
+  try {
+    cv.setPointerCapture(e.pointerId)
+  } catch {
+    /* not all pointer types allow capture; window listeners still cover us */
   }
-  pos(e)
-  const hit = uiHit(S.px, S.py)
-  if (hit === 'closehelp') {
-    S.help = 0
-    seen('1')
-    sfx('ui')
-    return
-  }
-  if (hit === 'help') {
-    S.help = 1
-    sfx('ui')
-    return
-  }
-  if (hit === 'mute') {
-    toggleMute()
-    sfx('ui')
-    return
-  }
-  if (hit === 'overload') {
-    overload()
-    return
-  }
-  if (S.scene !== SC_PLAY) {
-    // Any tap outside the chrome advances the panel.
-    if (S.over > 0.45) advance()
-    return
-  }
-  if (isUI(S.px, S.py)) return
-  S.down = 1
-  if (startTrail(S.px, S.py)) S.intro = 0
+  strokeStart(x, y)
 }
-
 const move = (e) => {
-  pos(e)
-  if (S.down && S.scene === SC_PLAY) extendTrail(S.px, S.py)
-}
-
-const up = () => {
-  S.down = 0
-  endTrail()
-}
-
-onpointerdown = down
-onpointermove = move
-onpointerup = up
-onpointercancel = up
-onresize = resize
-oncontextmenu = (e) => e.preventDefault()
-
-onkeydown = (e) => {
-  initAudio()
-  if (S.help) {
-    S.help = 0
-    seen('1')
+  if (!S.draw) return
+  // Safety net: if we are still "drawing" but nothing is pressed, a pointerup
+  // went missing (capture handover, a swallowed event, a lost pointer). End the
+  // stroke rather than leave ink hanging on screen forever.
+  if (e.buttons === 0) {
+    strokeEnd()
     return
   }
-  if (e.code === 'Space' || e.key === ' ') {
-    e.preventDefault()
-    if (S.scene === SC_PLAY) overload()
-    else if (S.over > 0.45) advance()
-  } else if (e.key === 'm' || e.key === 'M') {
-    toggleMute()
-  } else if (e.key === 'h' || e.key === 'H' || e.key === '?') {
-    S.help = 1
+  e.preventDefault()
+  // A pointer emits far more positions than there are frames. Coalesced events
+  // give us every one of them, so the ink follows the real path instead of
+  // cutting corners between frame samples.
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : 0
+  if (evs && evs.length) {
+    for (let i = 0; i < evs.length; i++) {
+      const [x, y] = toStage(evs[i].clientX, evs[i].clientY)
+      strokeMove(x, y)
+    }
+  } else {
+    const [x, y] = toStage(e.clientX, e.clientY)
+    strokeMove(x, y)
   }
 }
+const up = (e) => {
+  e.preventDefault()
+  strokeEnd()
+}
+cv.addEventListener('pointerdown', down)
+addEventListener('pointermove', move, { passive: false })
+addEventListener('pointerup', up)
+addEventListener('pointercancel', up)
+// Capture can be lost without an up/cancel ever reaching us.
+cv.addEventListener('lostpointercapture', up)
+// A stroke that leaves the window must still resolve, or the queue soft-locks.
+addEventListener('blur', up)
+cv.addEventListener('contextmenu', (e) => e.preventDefault())
 
-/* ------------------------------- loop ------------------------------- */
+addEventListener('keydown', (e) => {
+  wake()
+  const k = e.key
+  if (k === ' ' || k === 'Enter' || k === 'e' || k === 'E') {
+    e.preventDefault()
+    if (S.phase !== PH_DUEL) act(4)
+    else cast()
+  } else if (SPELLBOOK && k === 'Escape') S.book = 0
+  else if (k === 'm' || k === 'M') {
+    toggleMute()
+    save()
+  } else if (SPELLBOOK && (k === '?' || k === 'h' || k === 'H')) S.book = S.book ? 0 : 1
+})
 
-const loop = (ms) => {
-  requestAnimationFrame(loop)
-  let dt = (ms - last) / 1e3
-  last = ms
-  if (!(dt > 0)) dt = 0
-  dt = min(0.05, dt)
+/* ------------------------------- frame ------------------------------ */
+const STEP = 1 / 120 // fixed physics step: identical duel at 30 or 144 Hz
+let acc = 0
+let prev = 0
 
-  // Hit-stop: freeze the sim for a few ms on impact, keep drawing.
-  if (S.hitStop > 0) {
-    S.hitStop -= dt
-    dt *= 0.15
-  }
-
-  // Adaptive quality. Hardware varies wildly and a 13kB game cannot ship a
-  // settings menu, so watch the smoothed frame time and drop the expensive
-  // bloom pass when we fall behind. Hysteresis (24ms down, 15ms up) stops it
-  // oscillating frame to frame.
-  S.fdt = S.fdt * 0.94 + dt * 0.06
-  if (S.q) {
-    if (S.fdt > 0.024) S.q = 0
-  } else if (S.fdt < 0.015) S.q = 1
-
+const frame = (now) => {
+  requestAnimationFrame(frame)
+  const raw = prev ? (now - prev) / 1000 : 0.016
+  prev = now
+  // Clamp: a backgrounded tab returns a huge dt that would teleport shots.
+  const dt = clamp(raw, 0, 0.25)
   S.dt = dt
   S.t += dt
-  S.over += dt
-  if (S.hintT > 0) S.hintT -= dt
 
-  // The tutorial is modal — freeze the world so reopening it mid-region can
-  // never cost the player their hive.
-  if (!S.help) step(dt)
+  // Adaptive quality with hysteresis, so it settles instead of oscillating.
+  S.fdt += (raw - S.fdt) * 0.1
+  if (S.fdt > 0.024 && S.q > 0) S.q = 0
+  else if (S.fdt < 0.015 && S.q < 1) S.q = 1
+
+  acc = min(acc + dt, 0.25)
+  while (acc >= STEP) {
+    updateSim(STEP)
+    acc -= STEP
+  }
   updateFx(dt)
   tickAudio(dt)
-  frame(g)
+  render(g)
 }
 
-/* ------------------------------- boot ------------------------------- */
+/* -------------------------------- boot ------------------------------ */
+const boot = () => {
+  load()
+  resize()
+  resetDuel()
+  S.round = 1
+  requestAnimationFrame(frame)
+}
 
-initRender()
-resize()
-buildAtlas()
+if (WAVEDASH) {
+  /**
+   * WAVEDASH HANDSHAKE. Wavedash keeps its OWN loading screen up over the
+   * game and only takes it down once we report full progress and readiness —
+   * skip this pair and the player never sees the game at all, however fast it
+   * booted. The SDK arrives on a `<script>` that Wavedash's platform wrapper
+   * injects, so nothing is added to the page here.
+   *
+   * Three things this has to survive, all of them documented platform
+   * behaviour rather than paranoia:
+   *   · `WavedashJS` is a PROMISE, not an object — it must be awaited before
+   *     any method is read.
+   *   · Its methods can be MISSING on older wrappers — hence every call is
+   *     optional.
+   *   · The wrapper may never answer at all. A handshake that hangs would
+   *     leave a permanently black screen, so a 3s race boots the game anyway
+   *     and the ready signal is simply skipped. A game that runs unreported
+   *     beats a game that never starts.
+   */
+  ;(async () => {
+    let s
+    try {
+      // A NON-PROMISE in a race settles immediately, so a missing wrapper costs
+      // nothing: `s` comes back undefined and the game boots at once. The 3s
+      // only ever applies to a wrapper that answered with a promise and then
+      // stalled — which is the case that would otherwise hang on a black screen.
+      s = await Promise.race([self.WavedashJS, new Promise((r) => setTimeout(r, 3e3))])
+      await s?.init?.({})
+    } catch {
+      s = 0
+    }
+    boot()
+    // Only after init resolves: reporting ready before the SDK is up is the
+    // one ordering Wavedash does not accept.
+    s?.updateLoadProgressZeroToOne?.(1)
+    s?.readyForEvents?.()
+  })()
+} else boot()
 
-// Dev-only region jump for QA. DEBUG is a compile-time false in release, so
-// the whole block is dead code the bundler drops.
 if (DEBUG) {
-  window.__load = load
-  window.__S = S
-  window.__PROF = PROF
-  window.__frame = () => frame(g) // render one frame synchronously, for profiling
-  window.__step = (dt) => step(dt) // sim-only, for profiling
-  window.__q = Q // stage on/off switches, for cost attribution
-  window.__fx = (dt) => updateFx(dt)
+  // Synchronous hooks: rAF is throttled to ~1fps when the window is occluded,
+  // so all automated QA drives the game through these instead of the loop.
+  self.__S = S
+  self.__step = (n = 1, d = STEP) => {
+    for (let i = 0; i < n; i++) {
+      S.t += d
+      S.dt = d
+      updateSim(d)
+      updateFx(d)
+    }
+  }
+  self.__frame = () => render(g)
+  self.__cast = cast
+  self.__stroke = (pts) => {
+    strokeStart(pts[0], pts[1])
+    for (let i = 2; i < pts.length; i += 2) strokeMove(pts[i], pts[i + 1])
+    strokeEnd()
+  }
 }
-
-load(0)
-S.intro = 1
-if (!seen()) S.help = 1 // first ever visit: teach before anything else
-requestAnimationFrame(loop)

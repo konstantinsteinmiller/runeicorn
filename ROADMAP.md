@@ -1,201 +1,159 @@
-# Roadmap — retention, playtime, and conversion
+# Rune-icorn Duels — post-jam roadmap
 
-Every item is written against the shipped codebase, with the file it touches, a
-concrete implementation, a **byte cost** (because the jam build has a hard
-13,312 byte ceiling) and an effort estimate.
+Twenty action points, ordered inside four goals. Each carries a rough estimate
+and the concrete change to make, not just an aspiration. Estimates assume the
+current codebase (`sim.js` owns rules, `unicorn_state` owns all state, one
+localStorage key).
 
-`JAM` = fits inside the 13kB budget, worth doing before submission.
-`POST` = do it in the post-jam build where bytes are free.
-
-## Priority order (highest value first)
-
-| # | Feature | Metric moved | Bytes | Effort | When |
-|---|---------|--------------|-------|--------|------|
-| 1 | Campaign save | D1 retention | ~130 | 15 m | JAM |
-| 2 | Self-drawing ghost trail | Pickup / conversion | ~260 | 30 m | JAM |
-| 3 | Region star ratings | Playtime / replay | ~340 | 45 m | JAM |
-| 4 | Danger state feedback | Hard-to-put-down | ~220 | 30 m | JAM |
-| 5 | Kill combo multiplier | Hard-to-put-down | ~280 | 40 m | JAM |
-| 6 | Threat preview on world map | "One more region" | ~180 | 25 m | JAM |
-| 7 | Endless mode + score | Playtime | ~350 | 45 m | JAM |
-| 8 | Between-region boons | Playtime (roguelite) | ~700 | 1.5 h | JAM* |
-| 9 | Score card + Web Share | Conversion / virality | ~400 | 1 h | JAM* |
-| 10 | Daily seeded Infection | D1 return | ~420 | 1 h | POST |
-| 11 | New enemy archetypes | Playtime / depth | ~900 | 2 h | POST |
-| 12 | Boss Citadel | Playtime / climax | ~800 | 2 h | POST |
-| 13 | Unicorn variants | Depth / mastery | ~1.1 k | 2.5 h | POST |
-| 14 | Accessibility modes | Reach / conversion | ~300 | 45 m | POST |
-| 15 | Mobile ergonomics pass | Mobile conversion | ~250 | 1 h | POST |
-| 16 | Leaderboard | D1 return | ~600 | 2 h | POST |
-| 17 | Portal builds + rewarded ads | Monetization | n/a | 3 h | POST |
-| 18 | Replay ribbon | Virality | ~900 | 3 h | POST |
-
-`JAM*` = only if the budget allows after item 1–7; measure with `pnpm squeeze` first.
+Byte budget note: the jam build sits at ~12.2 kB of 13 kB. Items marked
+**(post-jam)** assume the size cap is lifted; items marked **(fits)** were
+costed to land inside the remaining headroom.
 
 ---
 
-## 1. Campaign save `JAM`
-**Metric:** Day-1 retention — a player who closes the tab mid-campaign currently loses everything.
+## A. Day-1 retention — give a reason to come back tomorrow
 
-**Implementation:** in `src/main.js`, write `{r: S.conquered, b: bestSwarm}` to
-`localStorage.pol` inside `load()` and on `SC_CLEAR`. On boot, `load(saved.r)`
-instead of `load(0)`. Wrap in try/catch — some portals block storage.
-Add a one-line "Resuming: <region name>" hint so the restore is *visible*;
-an invisible save does not create the feeling of progress that retains people.
+**A1. Daily rune seed — 3h (fits)**
+Derive a daily modifier from `floor(Date.now()/864e5)`: one element is
+"ascendant" and deals +25%. Show it as a small banner on the island at boot and
+tint that element's slot. Store `lastSeed` in the existing save blob; when it
+differs from today's, fire a "NEW DAY — ICE ASCENDANT" callout through the
+existing `S.pops` channel. Costs one integer in storage and reuses the popup
+system wholesale.
 
-## 2. Self-drawing ghost trail `JAM`
-**Metric:** Pickup rate / conversion — the single biggest drop-off in a
-drag-to-play game is a first-time player who does not realise they must drag.
+**A2. Win-streak ladder with a visible break point — 4h**
+Track `streak` alongside `wins`. Umbra's `lv` in `think()` already ramps with
+wins; re-key it to `streak` so a loss genuinely resets difficulty. Show
+"STREAK 4" under the HP bar and animate the number breaking on a loss. Loss
+aversion is the strongest day-2 hook available and this is ~30 lines.
 
-**Implementation:** in `src/ui.js`, if `S.intro && S.t > 3`, draw an animated
-dashed arc from the main hive toward the nearest grey castle, with the cursor
-glyph from the storyboard sliding along it on a loop. Kill it the instant
-`S.intro` goes to 0. Reuse `rainbow()` and the existing hint plate so it costs
-almost nothing. This converts confused players into playing players.
+**A3. Three named opponents instead of one — 8h**
+Umbra is one `chooseRune`/`think` policy. Add two more sharing the rig:
+*Sable* (barrier-heavy, punishes impatience) and *Vex* (fast single-rune
+spam, punishes over-stacking). Cycle per win. This converts "I beat the game"
+into "I have not beaten Vex yet", which is the actual retention lever.
 
-## 3. Region star ratings `JAM`
-**Metric:** Average playtime + replay — gives a reason to re-enter a cleared region.
+**A4. Local leaderboard of best times per opponent — 2h**
+`S.best` already exists and is saved. Widen to `best: {umbra, sable, vex}` and
+render the three rows on the result panel. Zero new systems.
 
-**Implementation:** on `SC_CLEAR` in `src/sim.js`, award: ★ cleared, ★ cleared
-under a per-region par time (store `par` in the region table in `world.js`),
-★ main hive never dropped below 100% HP. Persist a `stars[]` array alongside
-the save. Render stars on the world map nodes in `drawWorldMap`. Show
-"★★☆ — clear without losing hive HP" on the cleared panel so the missing star
-is a *specific* invitation, not a vague one.
-
-## 4. Danger state feedback `JAM`
-**Metric:** Hard-to-put-down — tension is what stops a player closing the tab.
-
-**Implementation:** when `S.hive.hp < 35`, push a lowpass + heartbeat pulse in
-`src/audio.js` (`setSwarm` already smooths; add a `danger(on)` that ramps a
-BiquadFilter on the master bus), tint the vignette red in `fx.drawPost`, and
-add a slow pulsing red rim on the hive in `sprites.drawCastle`. Near-loss that
-you *survive* is the most memorable moment a jam voter can have.
-
-## 5. Kill combo multiplier `JAM`
-**Metric:** Hard-to-put-down — converts steady grinding into escalating spectacle.
-
-**Implementation:** add `S.combo`, `S.comboT` to `state.js`. Every soldier kill
-in `updateSoldiers` sets `comboT = 2.5` and increments the combo; dust gain
-becomes `3 * (1 + combo/10)`. Raise the music bed's filter cutoff and add a
-rising arpeggio note per combo tier in `audio.js`. Draw the multiplier as big
-rainbow text near the swarm centroid. This makes a good route *feel* good.
-
-## 6. Threat preview on world map `JAM`
-**Metric:** "One more region" — the classic pull. Show the player exactly what
-new thing is waiting.
-
-**Implementation:** in `world.drawWorldMap`, under the next node, draw the icons
-of what the region introduces ("2 Void Mages", "Fortified Citadel"). Curiosity
-about a *named, visible* new threat is a far stronger hook than a number.
-
-## 7. Endless mode + score `JAM`
-**Metric:** Average playtime — gives the campaign a tail instead of a wall.
-
-**Implementation:** `makeRegion(i)` already scales procedurally past `REGIONS`.
-Add a persistent best-region + best-swarm score, show it on the defeat panel
-("Best: Region 9 · 812 unicorns"), and label regions past the curated set as
-"ENDLESS · Wave N". Near-zero cost, meaningful retention.
-
-## 8. Between-region boons `JAM*`
-**Metric:** Average playtime — turns a linear campaign into a roguelite run.
-
-**Implementation:** on the world map, offer 3 of ~8 boons: `+40% hive spawn`,
-`+1000 capacity`, `Overload costs 40`, `clones 2× on trails`, `soldiers drop
-double dust`, `trails resist the first cut`, `main hive regenerates`,
-`start each region with 40 unicorns`. Store as a flags/multipliers object read
-by `sim.js`. Choice + build variety is the single largest playtime multiplier
-available here; budget ~700 bytes and cut a decorative effect if needed.
-
-## 9. Score card + Web Share `JAM*`
-**Metric:** Conversion / virality during jam voting.
-
-**Implementation:** on defeat/final clear, compose a card on an offscreen canvas
-(peak swarm, castles converted, kills, region) and offer `navigator.share` /
-clipboard copy of the score text plus the game URL. Every share is a free
-funnel into the voting page.
-
-## 10. Daily seeded Infection `POST`
-**Metric:** Day-1 → Day-2 return, the strongest single retention lever.
-
-**Implementation:** seed `makeRegion` with the UTC date, one attempt per day,
-show yesterday's global best. `world.js` already uses a `seeded` PRNG, so this
-is mostly UI plus a tiny backend (or a portal leaderboard API).
-
-## 11. New enemy archetypes `POST`
-**Metric:** Playtime / depth — one new counter changes every route decision.
-
-**Implementation:** *Shield Phalanx* (immune from the front, must be flanked —
-forces trails that loop behind), *Cavalry* (charges along your trail toward the
-hive — punishes long undefended lines), *Void Obelisk* (permanent wound until
-destroyed — forces an offensive detour). Each is a small object type plus a
-branch in `updateSoldiers`.
-
-## 12. Boss Citadel `POST`
-**Metric:** Playtime + climax — campaigns need an ending players brag about.
-
-**Implementation:** a castle with 3 shield phases; each phase break spawns a
-mage ring and doubles soldier output. Reuse `drawCastle` with a larger radius
-and a phase-tinted shield arc. Pair with a music intensity layer.
-
-## 13. Unicorn variants `POST`
-**Metric:** Mastery depth — gives the swarm texture instead of uniform motes.
-
-**Implementation:** every 3rd converted hive spawns a variant: *Lancer*
-(pierces phalanxes), *Prism* (splits into 3 on death), *Void-eater* (shrinks
-wounds it touches). Add a `k` field on units, branch in `updateUnits`, and add
-one atlas row per variant in `sprites.js`.
-
-## 14. Accessibility modes `POST`
-**Metric:** Reach and conversion — a meaningful share of players bounce off
-heavy bloom and rainbow-on-grey.
-
-**Implementation:** a settings toggle for (a) reduced motion — clamp
-`shakeOffset` and flash to ~25%, honour `prefers-reduced-motion` by default,
-(b) high-contrast mode — raise trail luminance, drop grain and vignette,
-(c) colourblind-safe palette — swap `PAL` in `fx.js` and the trail ramp for a
-blue/orange/white scale. All three are palette and multiplier swaps.
-
-## 15. Mobile ergonomics pass `POST`
-**Metric:** Mobile conversion — most portal traffic is touch.
-
-**Implementation:** move the Overload button into the bottom-third thumb arc,
-add `navigator.vibrate` on conversion/overload, prevent scroll-bounce with
-`touch-action: none` (already set), enlarge hit targets to 48 CSS px, and
-detect low-end devices via `hardwareConcurrency` to auto-lower `UNIT_CAP` and
-`PART_CAP`. Test on a real 360×640 device.
-
-## 16. Leaderboard `POST`
-**Metric:** Day-1 return + competitive retention.
-
-**Implementation:** highest region + peak swarm, submitted per run. Use a
-portal-native leaderboard where available (CrazyGames/Playgama) so there is no
-backend to run, with a local-only fallback.
-
-## 17. Portal builds + rewarded ads `POST`
-**Metric:** Monetization and distribution.
-
-**Implementation:** the multi-platform build matrix (CrazyGames, Playgama,
-GamePix, GameMonetize). Natural rewarded-ad placement: *"Watch to start the
-region with a full Overload charge"* — value without pay-to-win. Mandatory
-platform rules: mute all audio for the ad's duration, fire `gameplayStop()`
-before the ad and `gameplayStart()` after, gate the rewarded button on
-readiness, and show any interstitial **before** the result panel, never over it.
-
-## 18. Replay ribbon `POST`
-**Metric:** Virality — the conversion explosion is the game's screenshot moment.
-
-**Implementation:** record a ring buffer of the last ~4 seconds of swarm
-positions (downsampled), then replay it on the score card as a looping
-animation. Cheaper and prettier than video capture, and it shows the exact
-moment a castle fell.
+**A5. Return-visit greeting — 1.5h**
+If `lastSeed` is 1 day old, open on "WELCOME BACK" with the streak intact; if
+older, restore the streak once as a "comeback" gift. Costs one branch and buys
+a measurable lift in day-2 return in games of this shape.
 
 ---
 
-## Instrumentation to add first (POST)
+## B. Average playtime — make a session longer than one duel
 
-None of the above should be prioritised on instinct once the game is on a
-portal. Log five events and let them rank the list: `region_start`,
-`region_clear`, `region_fail`, `first_trail_drawn` (the pickup funnel), and
-`overload_used`. The gap between "loaded" and `first_trail_drawn` is the single
-number that predicts jam ranking and portal conversion alike.
+**B1. Best-of-three match structure — 5h**
+The single duel is the unit of play but a poor unit of *session*. Wrap
+`resetDuel()` in a match: first to two duels. Carry a persistent scar (start
+at 90 HP after losing a round) so round three feels earned. `S.round` already
+exists and is unused — this is its purpose.
+
+**B2. Endless Gauntlet mode — 6h**
+Sequential opponents, HP carried over, one small heal between fights (a drawn
+star restores 8). Track depth in the save blob. This is the mode that produces
+20-minute sessions; everything it needs already exists except the heal branch
+in `strike()`.
+
+**B3. Spellbook as a completion meter — 2h (fits)**
+`S.seen` already records every discovered combination. Show "17 / 23 SPELLS"
+on the result panel and in the spellbook header. A visible incomplete set is
+the cheapest playtime extender in the build — the data is already persisted.
+
+**B4. Discovery rewards — 2.5h**
+First time a combination is cast, grant a small bonus (a free barrier next
+duel) and make the "NEW SPELL" callout larger and slower. Turns experimentation
+from a curiosity into a strategy.
+
+**B5. Practice target — 3h**
+A no-timer mode against a training dummy that reports recognition confidence
+per stroke. Reuses `rawScore()` from `runes.js`, which already returns the
+unthresholded score. Serves the players who bounce off gesture accuracy.
+
+---
+
+## C. Easy to pick up, hard to put down
+
+**C1. Two-beat onboarding is in; add the defensive beat — 2h (fits)**
+Current onboarding teaches draw → store → cast. It never teaches *blocking*,
+which is the skill that separates a 40-second loss from a win. Add beat 4:
+Umbra telegraphs a bolt, the box highlights, "DRAW ▢ TO BLOCK". Gate Umbra's
+first real cast until it resolves.
+
+**C2. Per-stroke recognition feedback — 2h (fits)**
+`recognise()` returns `-1` on a miss; the player learns nothing from a shake.
+Use `rawScore()` to say *why*: "TOO ROUND — SHARPEN THE CORNERS" when the best
+match was EARTH but the curvature gate (`ec > 20`) rejected it. The data is
+already computed; this is a message, not an algorithm.
+
+**C3. Rune-drawing assist ramp — 3h**
+Track a rolling recognition rate in `unicorn_state`. Below 60%, quietly relax
+`THRESH` from 0.78 toward 0.72 and raise `MAX_EC`; above 90%, restore them.
+Struggling players stop bouncing, skilled players never notice.
+
+**C4. Combo telegraph on the queue — 2h (fits)**
+The CAST button already previews the spell name. Add the damage number and a
+one-word type ("HEAVY · 32"). Making the trade-off between one fast rune and
+three slow ones legible *before* committing is what turns the queue into a
+decision.
+
+**C5. Cast-cancel window — 1.5h**
+150ms after cast, tapping the trash refunds the runes. Removes the sting of a
+misfire, which is the single most common rage-quit trigger in gesture games.
+
+**C6. Umbra tells, readable at a glance — 3h**
+Her forming rune is visible but small. Add a colour flare at her horn 0.4s
+before she casts, tinted by the element she is about to throw. Converts "the
+NPC is random" into "I misread her" — the difference between frustration and
+mastery.
+
+---
+
+## D. Converting new players
+
+**D1. First-30-seconds guarantee — 2h (fits)**
+Umbra currently opens after a 1.2s grace beat (`S.eThink`). Make her first
+cast non-lethal regardless of combo, and delay her opening to 4s on the very
+first duel only (`S.wins === 0`). Nobody should lose before understanding the
+verb.
+
+**D2. Silent-start audio — 1h (fits)**
+Audio requires a gesture, so the first seconds are silent — which reads as
+broken. Show a small "♪ TAP FOR SOUND" chip until the first input wakes the
+context.
+
+**D3. Instant replay of the killing blow — 4h**
+Record the last 2.5s of `S.shots` and HP into a small ring buffer; replay it
+behind the result panel. Cheap, and it makes a loss feel legible rather than
+arbitrary.
+
+**D4. Shareable result card — 3h**
+Render the result panel to an offscreen canvas with the time, streak and the
+final spell, and offer it via the Web Share API. Organic acquisition with no
+backend.
+
+**D5. Portal-safe wrapper pass — 4h**
+Before any portal submission, run the platform playbook: ad-audio mute
+guarantee (the master gain in `audio.js` is already a single node — mute it on
+ad start), ad **before** the result screen and never after, rewarded-video
+readiness gating, and `gameplayStart`/`gameplayStop` around `resetDuel()` and
+`finish()`. These are the exact traps that have caused past rejections.
+
+**D6. Input-method detection — 1h (fits)**
+The onboarding says "DRAW"; on touch it should say "TRACE WITH YOUR FINGER".
+One branch on `matchMedia('(pointer:coarse)')`, applied to the two onboarding
+strings and the control hint.
+
+---
+
+## Suggested order
+
+1. **D1, D2, C2, C4** — cheapest, and they fix the first-minute experience,
+   which gates everything else. (~7h, all fit in the current budget.)
+2. **A2, B3, A1** — the retention hooks that reuse systems already shipped.
+3. **B1, C1, C6** — depth: make the duel a match and the opponent readable.
+4. **A3, B2** — the content expansion that justifies the rest.
+5. **D5** before any portal build, without exception.

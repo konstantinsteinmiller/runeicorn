@@ -1,355 +1,438 @@
 /**
- * HUD + overlays. Drawn last, on an untransformed context, after world and FX.
+ * UI — every piece of on-canvas chrome.
  *
- * Every size flows from `S.sc`, recomputed in `layoutUI()` from the viewport, so
- * the same code reads on a 360px phone and on a 4K monitor. All text goes through
- * `text()`, which puts a dark outline (and optionally a dark plate) under a light
- * fill, because the scene underneath is a bright, saturated rainbow mess.
+ * HP bars, both rune queues, the drawing box, the CAST / spellbook / mute
+ * buttons, the onboarding, the spellbook tome, the floating callouts and
+ * the result panel. There is no DOM: everything here is drawn.
  *
- * Rects are plain arrays [x,y,w,h] — immune to property mangling, cheap to test.
- * They are rebuilt only on resize; `uiHit`/`isUI` are pure lookups.
+ * COORDINATES — pure STAGE units (1280x720). render.js applies the single
+ * letterbox transform, so this file never looks at the real viewport and the
+ * pointer coords arriving at `uiHit`/`isUI`/`inBox` are already stage space.
+ *
+ * STYLE — cel shading: flat fills, thick ink outlines, no gradients. Every
+ * light string is ink-stroked first so nothing floats bare on the scene, and
+ * sizes are picked to stay legible when the stage is letterboxed onto a phone.
+ *
+ * `G` is the current context: the two entry points park it there so all the
+ * internal helpers can stay one-liners.
  */
-import { S, SC_PLAY, SC_DEAD, ST_HIVE, OVERLOAD_COST, OVERLOAD_TIME, rainbow, pulse } from './state.js'
-import { clamp, min, max } from './u.js'
+import {
+  S,
+  SPELLS,
+  RUNES,
+  BOX,
+  SW,
+  SH,
+  PH_WIN,
+  MAX_RUNES,
+  HP_MAX,
+  FOES,
+  CTR,
+  spellFor,
+  pulse,
+} from './state.js'
+import { sin, cos, atan2, PI, TAU, clamp, damp } from './u.js'
 
-const TOUCH = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window
-const TAP = TOUCH ? 'Tap' : 'Click'
-const DRAG = (TOUCH ? 'Drag' : 'Click and drag') + ' to draw a Rainbow Trail'
-const F = 'px system-ui,sans-serif'
-const MF = 'px ui-monospace,monospace'
-const AL = ['left', 'center', 'right']
-const W = '#fff' // light fill
-const LIL = '#efe9ff' // light lilac
-const DIM = '#b9b5cb' // secondary
-const OFF = '#8f8ca0' // disabled
-const INK = '#06040ed9' // outline / plate ink
-const TITLE = 'PLAGUE OF LIGHT'
-/** Tutorial rows: [label, explanation]. Kept to six — anything longer is read
- *  by nobody, and every line costs bytes we do not have. */
-const HELP = [
-  ['DRAW', 'Drag from a glowing hive to lay a trail.'],
-  ['GROW', 'On a trail they clone, run faster and hit harder.'],
-  ['TAKE', 'Steer them into a grey castle to convert it.'],
-  ['GUARD', 'Soldiers march on your hive. Lose it, lose the region.'],
-  ['CUTS', 'Mages mark a spot, then sever the trail. Reroute!'],
-  ['BURST', (TOUCH ? 'Tap OVERLOAD' : 'Press SPACE') + ' to purge cuts and go invincible.'],
-]
-import { regionName } from './world.js'
+/* palette — kept tiny on purpose, every colour earns its bytes */
+const INK = '#0a0713' // outline on absolutely everything
+const GOLD = '#ffd76a' // Aurora + accents
+const PUR = '#c08cff' // Umbra
+const DK = '#181130' // idle plate
+const ACT = '#3b2a63' // live plate
+const RED = '#ff8092' // damage / warning
+const DIS = '#7a6f95' // disabled ink
+const LAV = '#cfc4ff' // secondary copy
+const BRN = '#4b2f1c' // tome cover + tome ink
+const DIM = '#9b8a72' // tome: undiscovered
+const F = 'px sans-serif' // generic on purpose: 'system-ui,' bought nothing visible
 
-/* cached geometry: overload btn, mute btn, capacity bar, HUD clusters, margin */
-let ob = [0, 0, 0, 0]
-let mb = ob
-let hb = ob
-let bar = ob
-let tl = ob
-let tr = ob
-let m = 8
+/* ------------------------------- layout -------------------------------- *
+ * Only the INTERACTIVE rects are cached ([x, y, w, h]); the rest of the HUD
+ * is drawn from constants. uiHit/isUI are pure lookups over these.        */
+let cast, mute, book, shopR
 
-let g // active context
-let introA = 1 // title-card fade
-let ovT = 0 // seconds the end panel has been up
-let hs = '' // latched S.hint + its own fade timer
-let ht = 0
-let rgn = -1 // region whose clock is running
-let rt0 = 0
+export const layoutUI = () => {
+  cast = [470, 596, 340, 80]
+  // mute slides into the corner the tome vacates; folded at compile time
+  mute = SPELLBOOK ? [1056, 610, 68, 62] : [1148, 602, 90, 74]
+  if (SPELLBOOK) book = [1148, 600, 96, 76]
+  // four element ranks, in a row across the result panel
+  shopR = [0, 1, 2, 3].map((i) => [388 + i * 130, 316, 114, 78])
+}
+layoutUI()
 
-/* ----------------------------- helpers ---------------------------- */
+/** Animated mirrors of state that must not pollute S. */
+let ha = HP_MAX
+let ea = HP_MAX
+let G
 
-const inR = (r, x, y) => x >= r[0] && y >= r[1] && x <= r[0] + r[2] && y <= r[1] + r[3]
+/* --------------------------- canvas micro-DSL --------------------------- */
+const bp = () => G.beginPath()
+const mv = (x, y) => G.moveTo(x, y)
+const ln = (x, y) => G.lineTo(x, y)
+const sk = (w, c) => ((G.lineWidth = w), (G.strokeStyle = c), G.stroke())
+const fi = (c) => ((G.fillStyle = c), G.fill())
+const al = (a) => (G.globalAlpha = a)
 
+/** Rounded-rect path (not roundRect: Safari 15 is in the build target). */
 const rr = (x, y, w, h, r) => {
-  g.beginPath()
-  g.roundRect(x, y, w, h, r)
+  bp()
+  mv(x + r, y)
+  G.arcTo(x + w, y, x + w, y + h, r)
+  G.arcTo(x + w, y + h, x, y + h, r)
+  G.arcTo(x, y + h, x, y, r)
+  G.arcTo(x, y, x + w, y, r)
 }
 
-/** Dark backdrop plate. */
-const panel = (x, y, w, h, a, r) => {
+/** Chunky ink-outlined plate — the base of every piece of chrome. */
+const panel = (x, y, w, h, r, f, lw) => {
   rr(x, y, w, h, r)
-  g.fillStyle = 'rgba(8,6,18,' + a + ')'
-  g.fill()
+  fi(f)
+  sk(lw || 5, INK)
 }
 
-/** Rainbow gradient across [x, x+w]. */
-const rbg = (x, w, off, l) => {
-  const q = g.createLinearGradient(x, 0, x + w, 0)
-  for (let i = 0; i < 4; i++) q.addColorStop(i / 3, rainbow(i / 3 + off, l))
-  return q
+/** One text run, ALWAYS ink-outlined for contrast. */
+/**
+ * `o` = outline colour; pass 0 for none. The dark halo exists so light copy
+ * survives on top of the game world — over the tome's cream page it only
+ * muddies dark ink, which is what made the spellbook so hard to read.
+ */
+const T = (s, x, y, z, c, a, o) => {
+  G.font = '900 ' + z + F
+  G.textAlign = a || 'center'
+  G.textBaseline = 'middle'
+  G.lineJoin = 'round'
+  if (o !== 0) {
+    G.strokeStyle = o || INK
+    G.lineWidth = z * 0.28
+    G.strokeText(s, x, y)
+  }
+  G.fillStyle = c || '#fff'
+  G.fillText(s, x, y)
 }
 
-/** Shrink a size so `s` fits inside `mw` px. */
-const fit = (s, px, mw) => min(px, mw / (s.length * 0.62))
+/** Button plate + optional pulsing "press me" ring. */
+const btn = (r, f, glow) => {
+  panel(r[0], r[1], r[2], r[3], 16, f)
+  if (glow) {
+    al(0.25 + 0.6 * glow)
+    rr(r[0] - 5, r[1] - 5, r[2] + 10, r[3] + 10, 20)
+    sk(4, GOLD)
+    al(1)
+  }
+}
+
+/** Full-screen dim + a big centred plate: spellbook and result share it. */
+const modal = (x, y, w, h, f) => {
+  G.fillStyle = '#06040cc4'
+  G.fillRect(0, 0, SW, SH)
+  panel(x, y, w, h, 28, f, 8)
+}
+
+/** HP bar. `gh` is the lagging ghost value, so damage drains as a red chunk. */
+const bar = (x, v, gh, c, nm, rt) => {
+  panel(x, 22, 366, 46, 23, '#1a1230')
+  const seg = (val, col) => {
+    const bw = 356 * clamp(val / HP_MAX, 0, 1)
+    bw > 2 && (rr(rt ? x + 361 - bw : x + 5, 27, bw, 36, 18), fi(col))
+  }
+  seg(gh, '#ff4d63')
+  seg(v, c)
+  T(nm, rt ? x + 350 : x + 16, 46, 27, 0, rt ? 'right' : 'left')
+}
+
+/* ------------------------------- glyphs -------------------------------- */
+
+/* Sides of each rune's polygon (WIND is the odd one out: two sine strokes).
+ * ICE walks every 2nd vertex of a pentagon = a unicursal star, EARTH is a
+ * 4-gon spun 45 degrees = a square. */
+const SIDES = [3, 0, 3, 4] // segments per glyph; ICE's Z has three
 
 /**
- * The one text routine: font, align (0 left / 1 centre / 2 right), optional dark
- * plate, dark outline, light fill. Returns the measured width.
+ * Draw one rune glyph, centred on x,y with radius r.
+ * 0 = FIRE triangle · 1 = WIND double wave · 2 = ICE zig-zag Z ·
+ * 3 = EARTH square.
+ * `f` < 1 draws only that fraction of the outline (the onboarding traces the
+ * triangle with it); returns the head of the stroke so a finger can ride it.
  */
-const text = (s, x, y, px, al, fill, mono, pl) => {
-  g.font = 'bold ' + px + (mono ? MF : F)
-  g.textAlign = AL[al]
-  g.textBaseline = 'middle'
-  g.lineJoin = 'round'
-  const d = g.measureText(s).width
-  if (pl) panel(x - (al === 1 ? d / 2 : 0) - px * 0.6, y - px * 0.85, d + px * 1.2, px * 1.7, pl, px)
-  g.lineWidth = max(2, px * 0.18)
-  g.strokeStyle = INK
-  g.strokeText(s, x, y)
-  g.fillStyle = fill
-  g.fillText(s, x, y)
-  return d
+export const drawGlyph = (g, k, x, y, r, a = 1, f = 1) => {
+  G = g
+  G.save()
+  al(a)
+  G.lineCap = G.lineJoin = 'round'
+  bp()
+  let p = [x, y]
+  if (k == 1)
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < 13; i++)
+        (i ? ln : mv)(
+          x + (i / 6 - 1) * r,
+          y + (j - 0.5) * r * 0.9 + sin((i / 12) * TAU) * r * 0.26
+        )
+  else {
+    // ICE is an open Z, the others are closed polygons — same walk, different
+    // vertex source, so one loop covers both.
+    const z = k == 2
+    const n = SIDES[k]
+    const R = k == 3 ? r * 1.06 : r
+    const e = n * f
+    const V = (i) => {
+      if (z) return [x + (i & 1 ? r : -r), y + (i < 2 ? -r : r) * 0.8]
+      const A = (k == 3 ? PI / 4 : -PI / 2) + (i / n) * TAU
+      return [x + cos(A) * R, y + sin(A) * R]
+    }
+    for (let i = 0; i <= e + 1; i++) {
+      const u = i > e ? e : i
+      const j = u | 0
+      const m = u - j
+      const a1 = V(j)
+      const b1 = V(j + 1)
+      p = [a1[0] + (b1[0] - a1[0]) * m, a1[1] + (b1[1] - a1[1]) * m]
+      ;(i ? ln : mv)(p[0], p[1])
+    }
+  }
+  sk(r * 0.52, INK)
+  sk(r * 0.3, RUNES[k][0])
+  G.restore()
+  return p
 }
 
-/** Pill button: plate, progress fill, live rim, label + sub-label. */
-const btn = (r, on, prog, lab, sub) => {
-  const [x, y, w, h] = r
-  const t = S.t
-  const p = pulse(t, 1.3)
-  const c = on ? rainbow(t * 0.35, 62 + 24 * p) : OFF
-  rr(x, y, w, h, h / 2)
-  g.fillStyle = on ? '#16082ae0' : INK
-  g.fill()
-  if (prog) {
-    g.save()
-    g.clip()
-    g.fillStyle = on ? rbg(x, w, t * 0.25, 52) : '#8282964d'
-    g.fillRect(x, y, w * prog, h)
-    g.restore()
-  }
-  // A soft double stroke instead of shadowBlur: `shadowBlur` re-rasterises the
-  // whole path through a blur kernel every frame, for every button.
-  if (on) {
-    g.globalAlpha = 0.3
-    g.lineWidth = max(3, h * (0.13 + 0.16 * p))
-    g.strokeStyle = c
-    rr(x, y, w, h, h / 2)
-    g.stroke()
-    g.globalAlpha = 1
-  }
-  g.lineWidth = max(2, h * 0.055)
-  g.strokeStyle = c
-  rr(x, y, w, h, h / 2)
-  g.stroke()
-  if (lab) {
-    text(lab, x + w / 2, y + h * 0.37, h * 0.32, 1, on ? W : OFF)
-    text(sub, x + w / 2, y + h * 0.72, h * 0.23, 1, on ? DIM : OFF)
+/** One queue slot at x (the row sits at y 82). `fm` = NPC rune forming. */
+const slot = (x, k, fm) => {
+  const cx = x + 28
+  panel(x, 82, 56, 56, 14, k == null ? DK + 'cc' : RUNES[k][0] + '2e', 4)
+  if (k != null) drawGlyph(G, k, cx, 110, 17)
+  else if (fm > 0) {
+    /* ai.js may expose the rune being charged as S.eRune; if not, a sigil. */
+    const a = 0.22 + 0.7 * fm
+    if (S.eRune >= 0) drawGlyph(G, S.eRune, cx, 110, 17, a)
+    else al(a), T('?', cx, 110, 32, PUR), al(1)
+    bp()
+    G.arc(cx, 110, 31, -PI / 2, -PI / 2 + TAU * fm)
+    sk(5, PUR)
   }
 }
 
-/* ------------------------------ layout ---------------------------- */
+/* --------------------------------- HUD --------------------------------- */
 
-export function layoutUI() {
-  const w = S.w
-  const h = S.h
-  /* ~1 at 900x600; 0.8 floor on a small phone, 2.1 ceiling on 4K */
-  const sc = (S.sc = clamp((min(w, h) + max(w, h) * 0.55) / 1100, 0.8, 2.1))
-  /* deeper inset in landscape so a notch / rounded corner never eats chrome */
-  m = (w > h ? 26 : 14) * sc
+export const drawHud = (g, t) => {
+  G = g
+  const dt = S.dt || 0
+  const q = S.queue.length
+  /* the ghost value snaps up (heal / new duel) and lags down (damage chunk) */
+  ha = S.hp > ha ? S.hp : damp(ha, S.hp, 5, dt)
+  ea = S.ehp > ea ? S.ehp : damp(ea, S.ehp, 5, dt)
 
-  const bw = min(w - m * 2, 320 * sc)
-  const bh = max(46, 54 * sc) // >= 46px: finger sized
-  ob = [(w - bw) / 2, h - m - bh, bw, bh]
-
-  const ms = max(46, 46 * sc)
-  mb = [w - m - ms, m, ms, ms]
-  // "?" stacks UNDER the mute button: the top-right row is already the
-  // castles/dust readout, and a third element there collides with it.
-  hb = [w - m - ms, m + ms + 8 * sc, ms, ms]
-
-  const lw = min(w * 0.42, 250 * sc)
-  const cb = max(18, 18 * sc)
-  bar = [m + 10 * sc, m + 40 * sc, lw - 20 * sc, cb]
-  tl = [m, m, lw, 46 * sc + cb]
-
-  const rw = min(w * 0.3, 200 * sc) + ms + 8 * sc
-  tr = [w - m - rw, m, rw, ms]
-}
-
-/* -------------------------------- HUD ----------------------------- */
-
-export function drawHud(ctx) {
-  g = ctx
-  const sc = S.sc
-  const t = S.t
-  const [bx, by, bw, cb] = bar
-  const [mx, my, ms] = mb
-  if (S.scene === SC_PLAY && S.region !== rgn) {
-    rgn = S.region
-    rt0 = t
-  }
   g.save()
-
-  /* the hero stat */
-  panel(...tl, 0.42, 14 * sc)
-  const d = text(S.units.length, bx, tl[1] + 20 * sc, 34 * sc, 0, rainbow(t * 0.2, 78), 1)
-  text('UNICORNS', bx + d + 8 * sc, tl[1] + 24 * sc, max(12, 12 * sc), 0, LIL)
-
-  /* prismatic capacity: rainbow while healthy, red-hot when nearly spent */
-  const f = clamp(S.capUsed / (S.cap || 1), 0, 1)
-  panel(bx, by, bw, cb, 0.55, cb / 2)
-  if (f) {
-    g.save()
-    rr(bx, by, bw, cb, cb / 2)
-    g.clip()
-    g.fillStyle = f > 0.86 ? rainbow(0.03 * pulse(t, 4), 46 + 16 * pulse(t, 4)) : rbg(bx, bw, t * 0.1, 58)
-    g.fillRect(bx, by, bw * f, cb)
-    g.restore()
+  bar(26, S.hp, ha, GOLD, 'AURORA', 0)
+  bar(888, S.ehp, ea, PUR, FOES[S.foe][0], 1)
+  /**
+   * WHAT THIS FOE FEARS, spelled out under its own HP bar. A weakness the
+   * player has to discover by elimination across a six-rung ladder is not a
+   * mechanic, it is a guessing game — and the coat colour alone says which
+   * element the foe IS, never which one beats it. So the counter-rune is drawn
+   * as the glyph the player actually has to draw, next to the multiplier it
+   * pays. Neutral rungs (Umbra, Prism) show nothing, which is itself the tell
+   * that there is nothing to exploit.
+   */
+  const fe = FOES[S.foe][1]
+  if (fe >= 0) {
+    // Rune + multiplier, no label: a glyph beside "x1.7" under the enemy's own
+    // bar already says "this element hits it harder", and the words were the
+    // expensive half. Right-aligned to the bar, which ends at x 1254.
+    al(0.55 + 0.25 * pulse(t, 0.6))
+    drawGlyph(G, CTR[fe], 1180, 162, 13)
+    T('x1.7', 1202, 162, 21, '#7dffa8', 'left')
+    al(1)
   }
-  const cs = 'PRISMATIC ' + (S.capUsed | 0) + '/' + (S.cap | 0)
-  text(cs, bx + bw / 2, by + cb / 2, fit(cs, cb * 0.62, tl[2]), 1, W)
-
-  /* castles converted + glitter dust */
-  let tot = 0
-  let con = 0
-  for (const c of S.castles)
-    if (!c.main) {
-      tot++
-      if (c.st === ST_HIVE) con++
-    }
-  const aff = S.dust >= OVERLOAD_COST
-  const rx = mx - 12 * sc
-  panel(...tr, 0.42, 14 * sc)
-  text('CASTLES ' + con + '/' + tot, rx, m + ms * 0.33, max(13, 15 * sc), 2,LIL)
-  text('DUST ' + (S.dust | 0) + '/' + OVERLOAD_COST, rx, m + ms * 0.68, max(13, 15 * sc), 2,aff ? rainbow(t * 0.3, 74) : DIM)
-
-  /* mute */
-  btn(mb, !S.muted, 0)
-  text(S.muted ? '✕' : '♪', mx + ms / 2, my + ms / 2, ms * 0.5, 1, S.muted ? OFF : W)
-
-  /* help */
-  btn(hb, 1, 0)
-  text('?', hb[0] + ms / 2, hb[1] + ms / 2, ms * 0.5, 1, W)
-
-  /* Overload Glitter Wave */
-  if (S.scene === SC_PLAY) {
-    const ov = S.overload
-    btn(
-      ob,
-      ov > 0 || aff,
-      ov > 0 ? ov / OVERLOAD_TIME : min(1, S.dust / OVERLOAD_COST),
-      ov > 0 ? 'GLITTER WAVE' : 'OVERLOAD',
-      ov > 0 ? 'SWARM IMMUNE' : (TOUCH ? 'TAP' : 'SPACE') + ' - ' + OVERLOAD_COST + ' DUST'
-    )
-    if (ov > 0) {
-      const s = 26 * sc
-      text('INVINCIBLE ' + ov.toFixed(1) + 's', S.w / 2, ob[1] - s, s, 1, rainbow(t * 0.5, 72), 0, 0.6)
-    }
+  for (let i = 0; i < MAX_RUNES; i++) {
+    slot(32 + i * 64, S.queue[i], 0)
+    slot(1192 - i * 64, S.equeue[i], i == S.equeue.length ? S.eForm : 0)
   }
+
+  /* Until the first rune is stored, say plainly that the whole screen works. */
+  if (!S.intro && !q) {
+    al(0.34 + 0.16 * pulse(t, 0.5))
+    T('DRAW A RUNE', 640, BOX.y - 26, 30, LAV)
+    al(1)
+  }
+
+  /* CAST shows the resulting spell name, so combos teach themselves. */
+  btn(cast, q ? ACT : DK, q && pulse(t, 0.9))
+  T(q ? spellFor(S.queue)[0] : '[Space] Cast', 640, 638, 34, q ? 0 : DIS)
+
+  /* spellbook (a closed tome), mute */
+  if (SPELLBOOK) {
+    btn(book, ACT)
+    rr(1175, 622, 42, 32, 6)
+    fi(BRN)
+    sk(5, GOLD)
+    bp()
+    mv(1188, 624)
+    ln(1188, 652)
+    sk(4, GOLD)
+  }
+  btn(mute, DK)
+  T('♪', SPELLBOOK ? 1090 : 1193, SPELLBOOK ? 641 : 639, 40, S.muted ? DIS : 0)
   g.restore()
 }
 
-/* ----------------------------- overlays --------------------------- */
+/* ------------------------------ onboarding ----------------------------- */
 
-export function drawOverlays(ctx) {
-  g = ctx
-  const sc = S.sc
-  const w = S.w
-  const h = S.h
-  const t = S.t
-  const dt = S.dt
-  const play = S.scene === SC_PLAY
-  ovT = play ? 0 : ovT + dt
-  introA = clamp(introA + (S.intro ? dt * 4 : -dt * 2.4), 0, 1)
-  g.save()
+const arrow = (x1, y1, x2, y2, t) => {
+  const a = atan2(y2 - y1, x2 - x1)
+  al(0.55 + 0.45 * pulse(t, 0.9))
+  bp()
+  mv(x1, y1)
+  ln(x2, y2)
+  for (const s of [2.5, -2.5]) mv(x2 + cos(a + s) * 26, y2 + sin(a + s) * 26), ln(x2, y2)
+  sk(9, GOLD)
+  al(1)
+}
 
-  /* tutorial — modal, shown once on the first ever run, reopened via "?" */
-  if (S.help) {
-    const u = max(15, 17 * sc)
-    const pw = min(w - m * 2, 560 * sc)
-    const ph = u * (HELP.length * 2.1 + 6.2)
-    const px = (w - pw) / 2
-    const py = (h - ph) / 2
-    g.fillStyle = 'rgba(4,3,10,.72)'
-    g.fillRect(0, 0, w, h)
-    panel(px, py, pw, ph, 0.94, u)
-    rr(px, py, pw, ph, u)
-    g.lineWidth = max(2, 2.4 * sc)
-    g.strokeStyle = rbg(px, pw, t * 0.2, 66)
-    g.stroke()
-    text('HOW TO PLAY', w / 2, py + u * 2, u * 1.5, 1, W)
-    for (let i = 0; i < HELP.length; i++) {
-      const y = py + u * (4.2 + i * 2.1)
-      text(HELP[i][0], px + u * 1.4, y, u * 0.95, 0, rainbow(i / HELP.length, 70))
-      text(HELP[i][1], px + u * 5.2, y, fit(HELP[i][1], u * 0.95, pw - u * 6.6), 0, LIL)
+/**
+ * SHOW, don't tell. Three short beats, none of which block play:
+ *   0 — a ghost finger traces a glowing triangle inside the box, on a loop
+ *   1 — an arrow flies from the box to the first queue slot
+ *   2 — an arrow points at CAST
+ * main.js owns S.introStep. There is no skip: the tutorial is three beats
+ * long and ends itself on the first cast (see `launch`).
+ */
+const intro = (t) => {
+  const s = S.introStep | 0
+  const cx = BOX.x + BOX.w / 2
+  if (s < 1) {
+    const R = 78
+    const cy = BOX.y + BOX.h / 2
+    /* 0..1 traced, then a short beat of held shape before the loop restarts */
+    drawGlyph(G, 0, cx, cy, R, 0.16)
+    const p = drawGlyph(G, 0, cx, cy, R, 1, clamp(((t * 0.45) % 1.3) * 1.18, 0, 1))
+    bp()
+    G.arc(p[0], p[1], 14, 0, TAU)
+    fi('#fff')
+    sk(4, INK)
+    T('DRAW THE RUNE', cx, BOX.y - 30, 36, GOLD)
+  } else if (s < 2) {
+    T('STORED! UP TO 3', cx, BOX.y - 30, 34, GOLD)
+  } else {
+    arrow(cx, 524, 640, 582, t)
+    T('NOW CAST IT', cx, 490, 36, GOLD)
+  }
+}
+
+/* -------------------------------- popups ------------------------------- */
+
+/** Floating callouts from S.pops — ui.js owns their ageing (key `a`). */
+const popups = (dt) => {
+  for (let i = S.pops.length; i--; ) {
+    const p = S.pops[i]
+    const k = (p.a = (p.a || 0) + dt) / 1.3
+    if (k > 1) {
+      S.pops.splice(i, 1)
+      continue
     }
-    text(TAP + ' anywhere to play', w / 2, py + ph - u * 1.9, u * 0.95, 1, DIM)
-    g.restore()
-    return
+    G.save()
+    al(k > 0.72 ? (1 - k) / 0.28 : 1)
+    G.translate(p.x || 640, (p.y || 300) - 84 * k)
+    const z = 1.4 - k * 0.4
+    G.scale(z, z)
+    T(p.s, 0, 0, 46, p.c || GOLD)
+    G.restore()
   }
+}
 
-  /* title card */
-  if (introA > 0.01) {
-    g.globalAlpha = introA
-    const fs = fit(TITLE, 58 * sc, w - m * 2)
-    const cy = h * 0.35
-    const pw = min(w - m * 2, fs * 10.5)
-    panel(w / 2 - pw / 2, cy - fs * 1.35, pw, fs * 3.3, 0.62, 18 * sc)
-    g.shadowColor = rainbow(t * 0.25, 62)
-    g.shadowBlur = fs * 0.45
-    text(TITLE, w / 2, cy - fs * 0.42, fs, 1, rbg(w / 2 - pw / 2, pw, t * 0.25, 66))
-    g.shadowBlur = 0
-    text('RAINBOW SWARM', w / 2, cy + fs * 0.52, fs * 0.42, 1, LIL)
-    text(DRAG, w / 2, cy + fs * 1.3, fit(DRAG, max(14, 16 * sc), pw - 24 * sc), 1, W)
-  }
+/* ------------------------------- spellbook ----------------------------- */
 
-  /* transient hint, latched locally so it always fades out */
-  if (S.hintT > ht) {
-    ht = S.hintT
-    hs = S.hint
-  }
-  ht = max(0, ht - dt)
-  if (ht && hs && play) {
-    g.globalAlpha = min(1, ht)
-    text(hs, w / 2, ob[1] - 62 * sc, max(14, 15 * sc), 1, W, 0, 0.6)
-  }
-  g.globalAlpha = 1
+/* singles, then pairs, then triples, then the full rainbow — a readable page */
+const KEYS = Object.keys(SPELLS).sort((a, b) => a.length - b.length)
 
-  /* region cleared / defeat */
-  if (!play) {
-    const dead = S.scene === SC_DEAD
-    const pw = min(w - m * 2, 560 * sc)
-    const ph = min(h - m * 2, 290 * sc)
-    const x = (w - pw) / 2
-    const y = (h - ph) / 2
-    const u = ph / 10
-    const rain = rbg(x, pw, t * 0.3, 68)
-    const s = (t - rt0) | 0
-    g.globalAlpha = min(1, ovT * 2.5)
-    panel(x, y, pw, ph, 0.88, 18 * sc)
-    g.lineWidth = max(2, 3 * sc)
-    g.strokeStyle = dead ? OFF : rain
-    rr(x, y, pw, ph, 18 * sc)
-    g.stroke()
+const spellbook = () => {
+  modal(110, 48, 1060, 624, BRN)
+  panel(126, 64, 1028, 592, 16, '#f2e3c0')
+  // Ink on paper: no halo, near-black for found spells, soft grey for unfound.
+  T('SPELLBOOK', 640, 106, 40, '#2a1608', 0, 0)
+  KEYS.map((k, i) => {
+    const x = 152 + (i % 3) * 340
+    const y = 164 + ((i / 3) | 0) * 60
+    if (S.seen[k]) {
+      for (let j = 0; j < k.length; j++) drawGlyph(G, +k[j], x + j * 28, y, 12)
+      T(SPELLS[k][0], x + 118, y, 24, '#2a1608', 'left', 0)
+    } else T('? ? ?', x - 12, y, 26, '#b3a184', 'left', 0)
+  })
+  T('✕', 1110, 104, 34, GOLD)
+}
 
-    const ttl = dead ? 'THE MAIN HIVE FELL' : 'REGION CLEARED'
-    const st =
-      S.units.length + ' UNICORNS   ' + (S.kills | 0) + ' PURGED   ' + ((s / 60) | 0) + ':' + ('0' + (s % 60)).slice(-2)
-    const p = TAP + (dead ? ' to retry' : ' to continue')
-    text(ttl, w / 2, y + u * 2, fit(ttl, u * 1.5, pw - u * 1.6), 1, dead ? DIM : rain)
-    text(regionName(S.region).toUpperCase(), w / 2, y + u * 3.7, u * 0.85, 1, dead ? OFF : LIL)
-    text(st, w / 2, y + u * 5.6, fit(st, u * 0.8, pw - u * 1.6), 1, W)
-    g.globalAlpha *= 0.55 + 0.45 * pulse(t, 0.7)
-    text(p, w / 2, y + ph - u * 1.4, u * 0.9, 1, W)
+/* ------------------------------ result panel --------------------------- */
+
+/**
+ * Result panel AND the whole shop. There is no separate screen and no level
+ * select: the ladder walks itself, and the one moment the player has coins
+ * they did not have before is the moment a duel ends — so that is where the
+ * ranks are bought. A plate lights up only when its rank is affordable, which
+ * is the entire affordance; anywhere else on the panel starts the next duel.
+ */
+const endPanel = (t) => {
+  const w = S.phase == PH_WIN
+  modal(340, 196, 600, 306, '#1a1230')
+  T(w ? 'VICTORY!' : 'DEFEATED', 640, 262, 52, w ? GOLD : RED)
+  shopR.map((r, i) => {
+    const c = 10 * (S.up[i] + 1)
+    const ok = S.coins >= c
+    panel(r[0], r[1], r[2], r[3], 14, ok ? ACT : DK)
+    drawGlyph(G, i, r[0] + 30, r[1] + 39, 14, ok ? 1 : 0.4)
+    T('+' + S.up[i] * 12 + '%', r[0] + 76, r[1] + 40, 21, ok ? '#fff' : DIS, 0, 0)
+  })
+  if (S.over > 0.5) {
+    al(0.5 + 0.5 * pulse(t, 0.7))
+    T('Tap to duel', 640, 452, 26)
+    al(1)
   }
+}
+
+/* ------------------------------- overlays ------------------------------ */
+
+export const drawOverlays = (g, t) => {
+  G = g
+  const dt = S.dt || 0
+  g.save()
+  if (S.intro && !S.book && !S.phase) intro(t)
+  popups(dt)
+  if (SPELLBOOK && S.book) spellbook()
+  if (S.phase) endPanel(t)
   g.restore()
 }
 
-/* ------------------------------- input ---------------------------- */
+/* ------------------------------ hit testing ---------------------------- */
 
-export function uiHit(x, y) {
-  if (S.help) return 'closehelp' // tutorial is modal: anywhere dismisses it
-  if (inR(mb, x, y)) return 'mute'
-  if (inR(hb, x, y)) return 'help'
-  if (S.scene !== SC_PLAY) return ovT > 0.45 ? 'advance' : null
-  return inR(ob, x, y) ? 'overload' : null
+const inR = (r, x, y) => x > r[0] && y > r[1] && x < r[0] + r[2] && y < r[1] + r[3]
+
+/**
+ * ACTION CODES, not names. This is a private protocol between uiHit and act —
+ * no value here ever reaches a player, a save file or an SDK, so there is
+ * nothing to gain from it being readable at runtime and a string per hit-test
+ * to lose. 0 = nothing hit, which `act` already treats as "not a UI press".
+ *   1 cast · 2 open book · 3 close book · 4 duel again · 5..8 element ranks
+ *   9 mute
+ */
+export const uiHit = (x, y) => {
+  if (S.phase) {
+    // Rank plates win over "tap to duel on", or the shop would be unreachable:
+    // the whole panel is the restart button.
+    const i = shopR.findIndex((r) => inR(r, x, y))
+    return i >= 0 ? 5 + i : S.over > 0.4 ? 4 : 0
+  }
+  return hitPlay(x, y)
 }
 
-export function isUI(x, y) {
-  return (
-    S.help ||
-    S.scene !== SC_PLAY ||
-    inR(ob, x, y) ||
-    inR(mb, x, y) ||
-    inR(hb, x, y) ||
-    inR(tl, x, y) ||
-    inR(tr, x, y)
-  )
-}
+const hitPlay = (x, y) =>
+  SPELLBOOK && S.book ? 3 : inR(cast, x, y) ? 1 : SPELLBOOK && inR(book, x, y) ? 2 : inR(mute, x, y) ? 9 : 0
+
+/**
+ * True for anything the game must not treat as a drawing stroke — i.e. real
+ * interactive targets only. The HP bars and rune slots are display-only, so
+ * they deliberately do NOT block: reserving that whole top band made strokes
+ * started up there vanish, which reads as "the press didn't register".
+ */
+export const isUI = (x, y) => !!uiHit(x, y) || !!(SPELLBOOK && S.book) || !!S.phase
+
+export const inBox = (x, y) => x > BOX.x && y > BOX.y && x < BOX.x + BOX.w && y < BOX.y + BOX.h
